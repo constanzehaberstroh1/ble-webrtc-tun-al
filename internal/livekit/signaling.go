@@ -60,7 +60,7 @@ func (s *SignalClient) Connect(ctx context.Context) error {
 			InsecureSkipVerify: false,
 		},
 		HandshakeTimeout: 15 * time.Second,
-		Subprotocols:     []string{"lk-protocol-16"},
+		Subprotocols:     []string{"lk-protocol-15"},
 	}
 
 	headers := http.Header{
@@ -126,7 +126,7 @@ func (s *SignalClient) buildWSURL() (string, error) {
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
 	q.Set("version", "2.13.6")
-	q.Set("protocol", "16")
+	q.Set("protocol", "15")
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()
 

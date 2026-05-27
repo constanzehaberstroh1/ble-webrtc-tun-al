@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,14 +12,10 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
+	"github.com/salman/ble-webrtc-tun/internal/rtpconn"
 )
 
 // webrtcLog is declared in videotunnel.go
-
-const (
-	dataChannelLabel  = "ble-tunnel"
-	maxBufferedAmount = 1024 * 1024 // 1MB buffer threshold
-)
 
 // SDPExchange is used for SDP serialization over the wire.
 // Pion v3's SDPType is an int enum that serializes to 0/1 instead
@@ -67,13 +64,14 @@ type Stats struct {
 	StartTime     time.Time
 }
 
-// WebRTCTransport manages the Pion WebRTC connection and DataChannel.
+// WebRTCTransport manages the Pion WebRTC connection.
+// All tunnel data flows through a fake Opus audio track via rtpconn,
+// making traffic appear as a normal voice call to DPI systems.
 type WebRTCTransport struct {
 	cfg        *config.Config
 	pc         *webrtc.PeerConnection
-	dc         *webrtc.DataChannel
-	videoTrack *webrtc.TrackLocalStaticSample // VP8 tunnel track
-	videoMode  bool                          // true = use video tunnel instead of DataChannel
+	audioTrack *webrtc.TrackLocalStaticSample // The fake Opus track
+	rtpConn    *rtpconn.Conn                  // Wraps the track for Read/Write
 	onData     func([]byte)                  // Callback for received data
 	mu         sync.RWMutex
 	connected  bool
@@ -84,8 +82,8 @@ type WebRTCTransport struct {
 // NewWebRTCTransport creates a new WebRTC transport.
 func NewWebRTCTransport(cfg *config.Config) *WebRTCTransport {
 	return &WebRTCTransport{
-		cfg:  cfg,
-		done: make(chan struct{}),
+		cfg:   cfg,
+		done:  make(chan struct{}),
 		stats: Stats{StartTime: time.Now()},
 	}
 }
@@ -98,29 +96,31 @@ func (t *WebRTCTransport) SetOnData(fn func([]byte)) {
 }
 
 // Initialize creates the PeerConnection with ICE servers.
+// CRITICAL: Registers ONLY Opus codec with RTCPFeedback:nil to disable
+// TWCC bandwidth throttling by the SFU.
 func (t *WebRTCTransport) Initialize(iceServersFromLK []livekit.ICEServerInfo) error {
 	iceServers := t.buildICEServers(iceServersFromLK)
 
 	pcConfig := webrtc.Configuration{
 		ICEServers: iceServers,
-		// Allow all ICE candidate types (host, srflx, relay)
-		// Relay-only fails when the TURN allocation isn't shared with LiveKit
 	}
 
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
-	settingEngine.SetDTLSRetransmissionInterval(500 * time.Millisecond)
 
-	// Register only VP8 codec to keep SDP small (Bale has message size limits)
+	// Register ONLY Opus. RTCPFeedback: nil disables TWCC/Bandwidth Throttling.
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeVP8,
-			ClockRate: 90000,
+			MimeType:     webrtc.MimeTypeOpus,
+			ClockRate:    48000,
+			Channels:     2,
+			SDPFmtpLine:  "minptime=10;useinbandfec=1",
+			RTCPFeedback: nil,
 		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
-		return fmt.Errorf("registering VP8 codec: %w", err)
+		PayloadType: 111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return fmt.Errorf("registering Opus codec: %w", err)
 	}
 
 	api := webrtc.NewAPI(
@@ -136,23 +136,15 @@ func (t *WebRTCTransport) Initialize(iceServersFromLK []livekit.ICEServerInfo) e
 	t.pc = pc
 	t.setupHandlers()
 
-	webrtcLog.Info("PeerConnection initialized with %d ICE servers", len(iceServers))
+	webrtcLog.Info("PeerConnection initialized with %d ICE servers (Opus Only, no TWCC)", len(iceServers))
 	return nil
 }
 
 // CreateOffer creates an SDP offer (client side).
 func (t *WebRTCTransport) CreateOffer() (string, error) {
-	// Create the DataChannel before creating offer (no negotiated ID — let browser-style negotiation work)
-	dcConfig := &webrtc.DataChannelInit{
-		Ordered: boolPtr(true),
+	if err := t.setupAudioTrack(); err != nil {
+		return "", err
 	}
-
-	dc, err := t.pc.CreateDataChannel(dataChannelLabel, dcConfig)
-	if err != nil {
-		return "", fmt.Errorf("creating data channel: %w", err)
-	}
-
-	t.setupDataChannel(dc)
 
 	offer, err := t.pc.CreateOffer(nil)
 	if err != nil {
@@ -189,6 +181,10 @@ func (t *WebRTCTransport) CreateOffer() (string, error) {
 
 // HandleOffer processes an SDP offer and returns an answer (server side).
 func (t *WebRTCTransport) HandleOffer(offerJSON string) (string, error) {
+	if err := t.setupAudioTrack(); err != nil {
+		return "", err
+	}
+
 	var exchange SDPExchange
 	if err := json.Unmarshal([]byte(offerJSON), &exchange); err != nil {
 		return "", fmt.Errorf("unmarshaling offer: %w", err)
@@ -256,44 +252,105 @@ func (t *WebRTCTransport) HandleAnswer(answerJSON string) error {
 	return nil
 }
 
-// Send writes data to the DataChannel or video tunnel.
-func (t *WebRTCTransport) Send(data []byte) error {
-	t.mu.RLock()
-	vm := t.videoMode
-	dc := t.dc
-	connected := t.connected
-	t.mu.RUnlock()
-
-	// Route through video tunnel if enabled
-	if vm {
-		return t.SendVideo(data)
+// setupAudioTrack initializes the fake Opus track and connects it to rtpconn.
+func (t *WebRTCTransport) setupAudioTrack() error {
+	audioTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio", "bale-audio",
+	)
+	if err != nil {
+		return fmt.Errorf("creating audio track: %w", err)
 	}
 
-	if !connected || dc == nil {
+	if _, err = t.pc.AddTrack(audioTrack); err != nil {
+		return fmt.Errorf("adding audio track: %w", err)
+	}
+
+	t.mu.Lock()
+	t.audioTrack = audioTrack
+	t.rtpConn = rtpconn.New(audioTrack, nil)
+	t.mu.Unlock()
+
+	// Start silence loop to keep the voice call "alive"
+	t.rtpConn.StartSilenceLoop()
+
+	// Start reading from rtpConn and pushing via onData callback
+	go t.readLoop()
+
+	return nil
+}
+
+// readLoop reads from rtpConn and pushes data via the onData callback.
+func (t *WebRTCTransport) readLoop() {
+	buf := make([]byte, 2048)
+	for {
+		t.mu.RLock()
+		conn := t.rtpConn
+		fn := t.onData
+		t.mu.RUnlock()
+
+		if conn == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			continue
+		}
+
+		if n > 0 && fn != nil {
+			t.stats.BytesReceived.Add(int64(n))
+			t.stats.PacketsRecv.Add(1)
+			fn(buf[:n])
+		}
+	}
+}
+
+// Send writes data via the Opus audio track (disguised as voice call).
+func (t *WebRTCTransport) Send(data []byte) error {
+	t.mu.RLock()
+	connected := t.connected
+	conn := t.rtpConn
+	t.mu.RUnlock()
+
+	if !connected || conn == nil {
 		return fmt.Errorf("not connected")
 	}
 
-	if dc.BufferedAmount() > maxBufferedAmount {
-		return fmt.Errorf("buffer full")
+	n, err := conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("sending data via rtp: %w", err)
 	}
 
-	if err := dc.Send(data); err != nil {
-		return fmt.Errorf("sending data: %w", err)
-	}
-
-	t.stats.BytesSent.Add(int64(len(data)))
+	t.stats.BytesSent.Add(int64(n))
 	t.stats.PacketsSent.Add(1)
 	return nil
 }
 
-// IsVideoMode returns whether the transport uses video tunnel.
-func (t *WebRTCTransport) IsVideoMode() bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.videoMode
+// EnableVideoTunnel is now a no-op — all traffic goes through Opus audio.
+// Kept for API compatibility with existing server code.
+func (t *WebRTCTransport) EnableVideoTunnel() error {
+	webrtcLog.Info("EnableVideoTunnel called — using Opus audio tunnel (no-op)")
+	return nil
 }
 
-// IsConnected returns whether the DataChannel is open.
+// StartKeepalive is now a no-op — rtpconn.StartSilenceLoop handles this.
+// Kept for API compatibility with existing server code.
+func (t *WebRTCTransport) StartKeepalive() {
+	webrtcLog.Info("StartKeepalive called — handled by rtpconn silence loop (no-op)")
+}
+
+// IsVideoMode always returns false — we use audio mode now.
+// Kept for API compatibility.
+func (t *WebRTCTransport) IsVideoMode() bool {
+	return false
+}
+
+// IsConnected returns whether the transport is connected.
 func (t *WebRTCTransport) IsConnected() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -313,7 +370,7 @@ func (t *WebRTCTransport) GetStats() map[string]interface{} {
 	}
 }
 
-// WaitForConnection blocks until the DataChannel is connected or context is cancelled.
+// WaitForConnection blocks until the transport is connected or context is cancelled.
 func (t *WebRTCTransport) WaitForConnection(ctx context.Context) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -334,10 +391,18 @@ func (t *WebRTCTransport) WaitForConnection(ctx context.Context) error {
 
 // Close shuts down the transport.
 func (t *WebRTCTransport) Close() error {
-	close(t.done)
-	if t.dc != nil {
-		t.dc.Close()
+	select {
+	case <-t.done:
+		// already closed
+		return nil
+	default:
+		close(t.done)
 	}
+	t.mu.Lock()
+	if t.rtpConn != nil {
+		t.rtpConn.Close()
+	}
+	t.mu.Unlock()
 	if t.pc != nil {
 		return t.pc.Close()
 	}
@@ -354,11 +419,8 @@ func (t *WebRTCTransport) setupHandlers() {
 			t.connected = false
 			t.mu.Unlock()
 		case webrtc.ICEConnectionStateConnected:
-			// Set connected when ICE reconnects (if DC or video track exists)
 			t.mu.Lock()
-			if t.dc != nil || t.videoMode {
-				t.connected = true
-			}
+			t.connected = true
 			t.mu.Unlock()
 		}
 	})
@@ -374,51 +436,29 @@ func (t *WebRTCTransport) setupHandlers() {
 		}
 	})
 
-	// Server side: handle incoming DataChannel from the offerer
-	t.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		webrtcLog.Info("📥 DataChannel received: label=%s", dc.Label())
-		t.setupDataChannel(dc)
-	})
-}
-
-// setupDataChannel configures the DataChannel event handlers.
-func (t *WebRTCTransport) setupDataChannel(dc *webrtc.DataChannel) {
-	dc.OnOpen(func() {
-		webrtcLog.Info("DataChannel '%s' opened", dc.Label())
-		t.mu.Lock()
-		t.dc = dc
-		t.connected = true
-		t.mu.Unlock()
-	})
-
-	dc.OnClose(func() {
-		webrtcLog.Info("DataChannel '%s' closed", dc.Label())
-		t.mu.Lock()
-		t.connected = false
-		t.mu.Unlock()
-	})
-
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		t.stats.BytesReceived.Add(int64(len(msg.Data)))
-		t.stats.PacketsRecv.Add(1)
+	// INCOMING RTP: Catch the raw Opus audio packets from the peer and pass to rtpconn
+	t.pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		if track.Codec().MimeType != webrtc.MimeTypeOpus {
+			return
+		}
+		webrtcLog.Info("🔊 Opus audio track received, starting VPN decapsulation")
 
 		t.mu.RLock()
-		fn := t.onData
+		conn := t.rtpConn
 		t.mu.RUnlock()
 
-		if fn != nil {
-			fn(msg.Data)
+		if conn == nil {
+			return
 		}
-	})
 
-	dc.OnError(func(err error) {
-		webrtcLog.Error("DataChannel error: %v", err)
-	})
-
-	// Set buffered amount low threshold for flow control
-	dc.SetBufferedAmountLowThreshold(maxBufferedAmount / 2)
-	dc.OnBufferedAmountLow(func() {
-		// Buffer drained, can resume sending
+		for {
+			rtpPacket, _, err := track.ReadRTP()
+			if err != nil {
+				webrtcLog.Error("ReadRTP error: %v", err)
+				return
+			}
+			conn.HandleRTP(rtpPacket.Payload)
+		}
 	})
 }
 
@@ -426,7 +466,6 @@ func (t *WebRTCTransport) setupDataChannel(dc *webrtc.DataChannel) {
 func (t *WebRTCTransport) buildICEServers(lkServers []livekit.ICEServerInfo) []webrtc.ICEServer {
 	var servers []webrtc.ICEServer
 
-	// Add servers from LiveKit
 	for _, s := range lkServers {
 		server := webrtc.ICEServer{URLs: s.URLs}
 		if s.Username != "" {
@@ -437,7 +476,6 @@ func (t *WebRTCTransport) buildICEServers(lkServers []livekit.ICEServerInfo) []w
 		servers = append(servers, server)
 	}
 
-	// Add configured servers if no LiveKit servers available
 	if len(servers) == 0 {
 		cfgServers := t.cfg.ICEServersConfig()
 		for _, s := range cfgServers {
@@ -453,5 +491,3 @@ func (t *WebRTCTransport) buildICEServers(lkServers []livekit.ICEServerInfo) []w
 
 	return servers
 }
-
-func boolPtr(b bool) *bool { return &b }

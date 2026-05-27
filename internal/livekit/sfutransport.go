@@ -112,7 +112,7 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false},
 		HandshakeTimeout: 15 * time.Second,
-		Subprotocols:     []string{"lk-protocol-16"},
+		Subprotocols:     []string{"lk-protocol-15"},
 	}
 	headers := http.Header{
 		"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
@@ -872,7 +872,7 @@ func (s *SFUTransport) buildWSURL() (string, error) {
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
 	q.Set("version", "2.13.6")
-	q.Set("protocol", "16")
+	q.Set("protocol", "15")
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()
 	return u.String(), nil
