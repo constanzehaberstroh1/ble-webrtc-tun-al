@@ -836,8 +836,8 @@ func (tm *TunnelManager) monitorAndReconnect(
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
-			// Check session health
+		case <-time.After(15 * time.Second):
+			// Check session health — 15s tolerance for WebRTC jitter
 			if currentSession != nil && !currentSession.IsClosed() {
 				continue
 			}
@@ -997,8 +997,9 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	}
 
 	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = false                    // Let SCTP/WebRTC handle connection health
-	ymuxCfg.ConnectionWriteTimeout = 120 * time.Second // Safety valve for stuck writes
+	ymuxCfg.EnableKeepAlive = true                     // Ping peer to detect dead connections
+	ymuxCfg.KeepAliveInterval = 15 * time.Second       // Tolerant of WebRTC jitter
+	ymuxCfg.ConnectionWriteTimeout = 30 * time.Second   // Allow time for relay RTT
 	ymuxCfg.StreamCloseTimeout = 120 * time.Second
 	ymuxCfg.MaxStreamWindowSize = 1024 * 1024          // 1MB — safer for SFU relay
 	ymuxCfg.LogOutput = io.Discard                     // Silence yamux internal logs

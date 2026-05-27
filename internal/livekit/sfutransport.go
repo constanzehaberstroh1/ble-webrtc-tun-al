@@ -73,9 +73,6 @@ type SFUTransport struct {
 	// SFU WS health monitoring
 	lastPongTime atomic.Int64 // unix millis of last SFU pong
 
-	// WebSocket pause: reduce WS traffic when WebRTC is connected
-	wsPaused atomic.Bool
-
 	// Buffered ICE candidates that arrive before remote description
 	pendingPubCandidates []webrtc.ICECandidateInit
 	pendingSubCandidates []webrtc.ICECandidateInit
@@ -258,28 +255,15 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Still create DataChannel as backup / for SFU expectations
-	ordered := true
-	dc, err := pc.CreateDataChannel("_reliable", &webrtc.DataChannelInit{
-		Ordered: &ordered,
-	})
-	if err != nil {
-		return fmt.Errorf("creating data channel: %w", err)
+
+	// No DataChannel needed — all tunnel data flows through Opus RTP.
+	// Creating a DataChannel would generate SCTP traffic detectable by DPI.
+	// Close dcReady immediately so nothing blocks on it.
+	select {
+	case <-s.dcReady:
+	default:
+		close(s.dcReady)
 	}
-	dc.OnOpen(func() {
-		sfuLog.Info("[SFU-Pub] DataChannel _reliable opened")
-		s.mu.Lock()
-		s.pubDC = dc
-		s.mu.Unlock()
-		select {
-		case <-s.dcReady:
-		default:
-			close(s.dcReady)
-		}
-	})
-	dc.OnClose(func() {
-		sfuLog.Info("[SFU-Pub] DataChannel _reliable closed")
-	})
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
@@ -290,14 +274,8 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		sfuLog.Info("[SFU-Pub] ICE: %s", state)
-		// Pause WebSocket when WebRTC is connected (Step 5 from roadmap)
-		if state == webrtc.ICEConnectionStateConnected {
-			s.wsPaused.Store(true)
-			sfuLog.Info("[SFU-Pub] WebRTC connected — pausing WS signaling")
-		} else if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateDisconnected {
-			s.wsPaused.Store(false)
-			sfuLog.Info("[SFU-Pub] WebRTC disconnected — resuming WS signaling")
-		}
+		// NOTE: Never pause the LiveKit WebSocket! The SFU requires continuous
+		// ping/pong and signaling or it will terminate the connection within seconds.
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -377,17 +355,12 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 		go s.readRemoteAudioTrack(remote)
 	})
 
-	// Handle incoming DataChannels from SFU (forwarded from other participant)
+	// Reject incoming DataChannels from SFU to prevent SCTP traffic.
+	// All tunnel data flows through Opus RTP — keeping DataChannels open
+	// creates DPI-detectable SCTP handshakes that can flag the connection.
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		sfuLog.Info("[SFU-Sub] DataChannel received: %s (id=%d)", dc.Label(), dc.ID())
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			s.mu.RLock()
-			dc := s.dataConn
-			s.mu.RUnlock()
-			if dc != nil {
-				dc.HandleMessage(msg)
-			}
-		})
+		sfuLog.Info("[SFU-Sub] Rejecting DataChannel: %s (id=%d) — audio-only mode", dc.Label(), dc.ID())
+		dc.Close()
 	})
 
 	s.subPC = pc
@@ -806,12 +779,7 @@ func (s *SFUTransport) sfuPing(ctx context.Context) {
 					Ping: time.Now().UnixMilli(),
 				},
 			}
-			// Step 5: Skip ping when WS is paused (call active)
-			// Only send minimal pings to prevent WS timeout
-			if s.wsPaused.Load() {
-				// Still send pings but less frequently — handled by the 10s ticker
-				// which is already infrequent enough
-			}
+			// Always send pings — LiveKit requires continuous signaling
 			if err := s.sendSignal(req); err != nil {
 				sfuLog.Warn("SFU ping failed: %v — signaling teardown", err)
 				s.mu.Lock()

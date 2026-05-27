@@ -692,8 +692,9 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	}
 
 	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = false                    // Let SCTP/WebRTC handle connection health
-	ymuxCfg.ConnectionWriteTimeout = 120 * time.Second // Safety valve for stuck writes
+	ymuxCfg.EnableKeepAlive = true                     // Ping peer to detect dead connections
+	ymuxCfg.KeepAliveInterval = 15 * time.Second       // Tolerant of WebRTC jitter
+	ymuxCfg.ConnectionWriteTimeout = 30 * time.Second   // Allow time for relay RTT
 	ymuxCfg.StreamCloseTimeout = 120 * time.Second
 	ymuxCfg.MaxStreamWindowSize = 1024 * 1024          // 1MB — safer for SFU relay
 	ymuxCfg.LogOutput = io.Discard                     // Silence yamux internal logs
