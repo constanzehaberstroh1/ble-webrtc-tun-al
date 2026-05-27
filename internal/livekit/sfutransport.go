@@ -212,16 +212,18 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
+			MimeType:     webrtc.MimeTypeOpus,
+			ClockRate:    48000,
+			Channels:     2,
+			SDPFmtpLine:  "minptime=10;useinbandfec=1",
+			RTCPFeedback: nil, // CRITICAL: disables TWCC/NACK congestion control
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return err
 	}
 	// NOTE: We deliberately do NOT register TWCC header extensions.
-	// This forces the SFU to blindly forward packets at maximum speed.
+	// RTCPFeedback:nil strips congestion control, SDPFmtpLine mimics real Opus.
 
 	se := webrtc.SettingEngine{}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
@@ -312,9 +314,11 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
+			MimeType:     webrtc.MimeTypeOpus,
+			ClockRate:    48000,
+			Channels:     2,
+			SDPFmtpLine:  "minptime=10;useinbandfec=1",
+			RTCPFeedback: nil, // Disables congestion control throttling
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {

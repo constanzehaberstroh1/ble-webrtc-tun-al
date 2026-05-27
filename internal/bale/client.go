@@ -108,16 +108,21 @@ send:
 	case resp := <-c.rpcRespCh:
 		info := &UserInfo{UserID: userID}
 
-		// Extract access_hash (field 2, varint > 100M, not equal to userID)
-		for i := 0; i < len(resp)-2; i++ {
-			if resp[i] == 0x10 { // field 2, varint
-				val, n := binary.Uvarint(resp[i+1:])
-				if n > 0 && val > 100000000 && int64(val) != userID {
-					info.AccessHash = int64(val)
-					break
+		// Extract access_hash using proper protobuf parsing (field 2, varint)
+		var findHash func(b []byte)
+		findHash = func(b []byte) {
+			fields := ParseProtoFields(b)
+			for _, f := range fields {
+				if f.FieldNum == 2 && f.WireType == 0 && f.Varint > 100000000 && int64(f.Varint) != userID {
+					info.AccessHash = int64(f.Varint)
+					return
+				}
+				if f.WireType == 2 && len(f.Bytes) > 2 && info.AccessHash == 0 {
+					findHash(f.Bytes)
 				}
 			}
 		}
+		findHash(resp)
 
 		// Cache access hash
 		if info.AccessHash != 0 {
@@ -563,53 +568,24 @@ func (c *Client) handlePushEvent(data []byte) {
 }
 
 // extractCallIDFromPush extracts a call ID from a push event message.
-// The call info is deeply nested: field 2 → field 1 → field 1 → (extension) → field 1.
-// Inside that: field 1 = callID, field 3 = roomID (UUID), field 8 = callerUserID.
+// Uses proper protobuf field parsing instead of fragile byte-scanning.
+// The call ID is field 1 (large varint) nested in the call info message.
 func extractCallIDFromPush(data []byte) int64 {
-	// Find room UUID as anchor — "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-	roomIdx := -1
-	for i := 0; i < len(data)-36; i++ {
-		if data[i+8] == '-' && data[i+13] == '-' && data[i+18] == '-' && data[i+23] == '-' {
-			roomIdx = i
-			break
-		}
-	}
-
-	// The call ID is field 1 (tag 0x08) BEFORE the room UUID,
-	// encoded as a large varint (typically 8-10 bytes)
-	if roomIdx > 5 {
-		for i := roomIdx - 2; i >= 0; i-- {
-			if data[i] == 0x08 { // field 1, varint
-				val, n := binary.Uvarint(data[i+1:])
-				if n > 4 && val > 1000000 {
-					return int64(val)
-				}
-			}
-		}
-	}
-
-	// Fallback: scan all 0x08 tags for any large varint
-	for i := 0; i < len(data)-6; i++ {
-		if data[i] == 0x08 {
-			val, n := binary.Uvarint(data[i+1:])
-			if n > 4 && val > 1000000 {
-				return int64(val)
-			}
-		}
+	// Use the proper protobuf reader to recursively find field 1
+	// with a large value (call IDs are > 1000000)
+	if val, ok := RecursiveFindVarint(data, 1, 1000000); ok {
+		return int64(val)
 	}
 	return 0
 }
 
 // extractCallerIDFromPush extracts the caller user ID from a call push event.
-// The caller ID is in field 8 of the call info message.
+// Uses proper protobuf parsing to find field 8 (caller user ID).
 func extractCallerIDFromPush(data []byte) int64 {
-	// Field 8 varint tag = (8 << 3) | 0 = 0x40
-	for i := 0; i < len(data)-2; i++ {
-		if data[i] == 0x40 { // field 8, varint
-			val, n := binary.Uvarint(data[i+1:])
-			if n > 0 && val > 100000 && val < 10000000000 {
-				return int64(val)
-			}
+	// Field 8 is the caller user ID, a moderate-sized varint
+	if val, ok := RecursiveFindVarint(data, 8, 100000); ok {
+		if val < 10000000000 { // sanity check: not a timestamp
+			return int64(val)
 		}
 	}
 	return 0
@@ -646,23 +622,26 @@ send:
 		// Inside user details: F1=userID (varint), F2=access_hash (varint)
 		// Access hashes are full 64-bit values, NOT limited to 32-bit range.
 
-		// Strategy: find the target userID in the response, then the next field 2
-		// varint after it is the access_hash.
+		// Use proper protobuf field parsing instead of scanning for 0x10 bytes.
+		// Field 2 = access_hash (varint) in the user details message.
 		var bestHash int64
-		for i := 0; i < len(resp)-2; i++ {
-			if resp[i] == 0x10 { // field 2, varint wire type
-				val, n := binary.Uvarint(resp[i+1:])
-				if n > 0 && val > 100000000 {
-					// Accept any large value as access_hash candidate.
-					// Skip values that match the userID itself.
-					if int64(val) != userID {
-						bestHash = int64(val)
-						baleLog.Info("Candidate access_hash: %d (0x%x)", val, val)
-						break // Take the first valid candidate
+		var findAccessHash func(b []byte)
+		findAccessHash = func(b []byte) {
+			fields := ParseProtoFields(b)
+			for _, f := range fields {
+				if f.FieldNum == 2 && f.WireType == 0 && f.Varint > 100000000 {
+					if int64(f.Varint) != userID && bestHash == 0 {
+						bestHash = int64(f.Varint)
+						baleLog.Info("Candidate access_hash: %d (0x%x)", f.Varint, f.Varint)
 					}
+				}
+				// Recurse into nested messages
+				if f.WireType == 2 && len(f.Bytes) > 2 {
+					findAccessHash(f.Bytes)
 				}
 			}
 		}
+		findAccessHash(resp)
 		if bestHash != 0 {
 			baleLog.Info("Using access_hash for user %d: %d", userID, bestHash)
 			c.accessHashMu.Lock()
@@ -1389,61 +1368,132 @@ func containsBytes(data, pattern []byte) bool {
 }
 
 func extractVarint(data []byte) int64 {
-	// Try to find a varint after field tag 0x08 (field 1, varint)
-	for i := 0; i < len(data)-1; i++ {
-		if data[i] == 0x08 {
-			val, _ := binary.Uvarint(data[i+1:])
-			if val > 1000 {
-				return int64(val)
-			}
-		}
+	// Use proper protobuf reader to find field 1 with large value
+	if val, ok := RecursiveFindVarint(data, 1, 1000); ok {
+		return int64(val)
 	}
 	return 0
 }
 
 func extractCallAcceptInfo(data []byte) (token, roomID, wssURL string) {
-	text := string(data)
-	// Find JWT token
-	for i := 0; i < len(text)-10; i++ {
-		if text[i:i+10] == "eyJhbGciOi" {
-			// Find end of JWT
-			end := i + 10
-			for end < len(text) {
-				c := text[end]
-				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
-					end++
-				} else {
+	// Use proper protobuf field parsing instead of scanning for magic strings.
+	// All three values are length-delimited (wire type 2) string fields in
+	// nested protobuf messages.
+
+	// JWT tokens always start with "eyJ" (base64 of '{"')
+	token, _ = RecursiveFindString(data, 0, func(s string) bool {
+		return len(s) > 50 && len(s) > 3 && s[:3] == "eyJ"
+	})
+	// If field-number-specific search fails, try any field
+	if token == "" {
+		fields := ParseProtoFields(data)
+		for _, f := range fields {
+			if f.WireType == 2 {
+				// Try nested
+				t, r, w := extractCallAcceptInfoNested(f.Bytes)
+				if t != "" {
+					token = t
+				}
+				if r != "" {
+					roomID = r
+				}
+				if w != "" {
+					wssURL = w
+				}
+			}
+		}
+	}
+
+	// Room ID is a UUID string (field with 36 chars, dashes at 8,13,18,23)
+	if roomID == "" {
+		roomID, _ = RecursiveFindString(data, 0, func(s string) bool {
+			return isUUID(s)
+		})
+	}
+
+	// WSS URL starts with "wss://"
+	if wssURL == "" {
+		wssURL, _ = RecursiveFindString(data, 0, func(s string) bool {
+			return len(s) > 6 && s[:6] == "wss://"
+		})
+	}
+
+	// Fallback: scan raw bytes for these patterns (backwards compat)
+	if token == "" || roomID == "" || wssURL == "" {
+		text := string(data)
+		if token == "" {
+			for i := 0; i < len(text)-10; i++ {
+				if text[i:i+10] == "eyJhbGciOi" {
+					end := i + 10
+					for end < len(text) {
+						c := text[end]
+						if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
+							end++
+						} else {
+							break
+						}
+					}
+					token = text[i:end]
 					break
 				}
 			}
-			token = text[i:end]
-			break
 		}
-	}
-
-	// Find room ID (UUID format)
-	for i := 0; i < len(text)-36; i++ {
-		if isUUIDChar(text[i]) && i+36 <= len(text) {
-			candidate := text[i : i+36]
-			if isUUID(candidate) {
-				roomID = candidate
-				break
+		if roomID == "" {
+			for i := 0; i < len(text)-36; i++ {
+				if isUUIDChar(text[i]) && i+36 <= len(text) {
+					candidate := text[i : i+36]
+					if isUUID(candidate) {
+						roomID = candidate
+						break
+					}
+				}
+			}
+		}
+		if wssURL == "" {
+			for i := 0; i < len(text)-6; i++ {
+				if text[i:i+6] == "wss://" {
+					end := i + 6
+					for end < len(text) && text[end] != 0 && text[end] > 32 && text[end] < 127 {
+						end++
+					}
+					wssURL = text[i:end]
+					break
+				}
 			}
 		}
 	}
 
-	// Find wss:// URL
-	for i := 0; i < len(text)-6; i++ {
-		if text[i:i+6] == "wss://" {
-			end := i + 6
-			for end < len(text) && text[end] != 0 && text[end] > 32 && text[end] < 127 {
-				end++
+	return
+}
+
+// extractCallAcceptInfoNested is a helper for recursive protobuf extraction.
+func extractCallAcceptInfoNested(data []byte) (token, roomID, wssURL string) {
+	fields := ParseProtoFields(data)
+	for _, f := range fields {
+		if f.WireType == 2 && isPrintableString(f.Bytes) {
+			s := string(f.Bytes)
+			if len(s) > 50 && len(s) > 3 && s[:3] == "eyJ" && token == "" {
+				token = s
+			} else if isUUID(s) && roomID == "" {
+				roomID = s
+			} else if len(s) > 6 && s[:6] == "wss://" && wssURL == "" {
+				wssURL = s
 			}
-			wssURL = text[i:end]
-			break
+		}
+		// Recurse
+		if f.WireType == 2 && len(f.Bytes) > 2 {
+			t, r, w := extractCallAcceptInfoNested(f.Bytes)
+			if t != "" && token == "" {
+				token = t
+			}
+			if r != "" && roomID == "" {
+				roomID = r
+			}
+			if w != "" && wssURL == "" {
+				wssURL = w
+			}
 		}
 	}
-
 	return
 }
 
