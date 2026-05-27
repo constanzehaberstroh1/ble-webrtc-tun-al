@@ -125,7 +125,7 @@ func (s *SignalClient) buildWSURL() (string, error) {
 	q.Set("access_token", s.cfg.LiveKitToken)
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
-	q.Set("version", "2.15.2")
+	q.Set("version", "2.13.6")
 	q.Set("protocol", "16")
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()

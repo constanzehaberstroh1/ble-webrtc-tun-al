@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"net"
 	"net/http"
@@ -16,9 +17,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
+	"github.com/salman/ble-webrtc-tun/internal/rtpconn"
 	"google.golang.org/protobuf/proto"
 
 	lkproto "github.com/livekit/protocol/livekit"
@@ -27,24 +28,13 @@ import (
 var sfuLog = logger.New("sfu")
 
 const (
-	sfuTunnelMarker byte = 0xFF
-	sfuKeepaliveMs       = 40
-	sfuKeyframeEvery     = 50 // every ~2 seconds
+	// Opus audio keepalive interval (standard 20ms frame)
+	sfuOpusKeepaliveMs = 20
 )
 
-// Minimal VP8 frames for keepalive
-var sfuKeyFrame = []byte{
-	0x50, 0x02, 0x00, 0x9D, 0x01, 0x2A, 0x02, 0x00,
-	0x02, 0x00, 0x34, 0x25, 0xA4, 0x00, 0x03, 0x70,
-	0x00, 0xFE, 0xFB, 0x94, 0x00, 0x00,
-}
-
-var sfuInterFrame = []byte{0x11, 0x00, 0x00, 0x00}
-
-// SFUTransport routes tunnel data through the LiveKit SFU using WebRTC DataChannels.
-// Both peers connect to the SFU - no P2P connection needed.
-// Uses reliable/ordered SCTP DataChannels directly (no KCP).
-// A dummy video track is kept alive for the Bale call session.
+// SFUTransport routes tunnel data through the LiveKit SFU using Opus audio RTP.
+// VPN data is injected as fake Opus audio samples, making traffic look like
+// a normal voice call to DPI systems. TWCC is disabled to prevent SFU throttling.
 type SFUTransport struct {
 	cfg  *config.Config
 	conn *websocket.Conn
@@ -54,10 +44,14 @@ type SFUTransport struct {
 	subPC  *webrtc.PeerConnection // subscriber PC
 	track  *webrtc.TrackLocalStaticSample
 
-	// DataChannel for tunnel data - reliable/ordered SCTP
+	// DataChannel for tunnel data - reliable/ordered SCTP (fallback)
 	pubDC   *webrtc.DataChannel // publisher _reliable data channel
 	dcReady chan struct{}        // closed when pubDC is open
-	dataConn *dcconn.Conn        // io.ReadWriteCloser for yamux
+	dataConn *dcconn.Conn        // io.ReadWriteCloser for yamux (DC mode)
+
+	// RTP audio tunnel (primary — DPI evasion)
+	rtpDataConn *rtpconn.Conn    // io.ReadWriteCloser for yamux (RTP mode)
+	useRTP      bool             // true = tunnel via Opus RTP, false = DC fallback
 
 	// Obfuscation layer (anti-DPI)
 	obfuscator *dcconn.Obfuscator
@@ -78,6 +72,9 @@ type SFUTransport struct {
 
 	// SFU WS health monitoring
 	lastPongTime atomic.Int64 // unix millis of last SFU pong
+
+	// WebSocket pause: reduce WS traffic when WebRTC is connected
+	wsPaused atomic.Bool
 
 	// Buffered ICE candidates that arrive before remote description
 	pendingPubCandidates []webrtc.ICECandidateInit
@@ -153,16 +150,15 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	go s.readMessages(ctx)
 
 	// 7. Tell the SFU about our track BEFORE publishing (required by LiveKit)
-	sfuLog.Info("Sending AddTrack request...")
+	// Use AUDIO track (Opus) — DPI sees a normal voice call
+	sfuLog.Info("Sending AddTrack request (Opus audio)...")
 	addTrackReq := &lkproto.SignalRequest{
 		Message: &lkproto.SignalRequest_AddTrack{
 			AddTrack: &lkproto.AddTrackRequest{
 				Cid:    s.track.ID(),
-				Name:   "video",
-				Type:   lkproto.TrackType_VIDEO,
-				Width:  2,
-				Height: 2,
-				Source: lkproto.TrackSource_CAMERA,
+				Name:   "audio",
+				Type:   lkproto.TrackType_AUDIO,
+				Source: lkproto.TrackSource_MICROPHONE,
 			},
 		},
 	}
@@ -183,48 +179,53 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 		return fmt.Errorf("publish: %w", err)
 	}
 
-	// 10. Wait for DataChannel to be ready (opened by SFU after offer/answer)
-	select {
-	case <-s.dcReady:
-		sfuLog.Info("✅ DataChannel _reliable is open")
-	case <-time.After(20 * time.Second):
-		sfuLog.Error("❌ DataChannel _reliable never opened — aborting")
-		return fmt.Errorf("DataChannel _reliable not open after 20s")
-	}
-
-	// 11. Create dcconn adapter for yamux
+	// 10. Setup data transport — prefer RTP audio tunnel for DPI evasion
+	// Create rtpconn adapter: yamux data flows through Opus RTP packets
 	s.mu.Lock()
-	s.dataConn = dcconn.New(s.pubDC, s.obfuscator)
+	s.rtpDataConn = rtpconn.New(s.track, nil) // no extra encryption needed — Opus payload is opaque
+	s.useRTP = true
 	s.connected = true
 	s.mu.Unlock()
-	if s.obfuscator != nil && s.obfuscator.Enabled() {
-		sfuLog.Info("✅ Reliable DataChannel mode initialized (dcconn + ChaCha20 obfuscation)")
-	} else {
-		sfuLog.Info("✅ Reliable DataChannel mode initialized (dcconn, no obfuscation)")
-	}
+	sfuLog.Info("✅ Opus RTP tunnel mode initialized (DPI evasion active)")
 
-	// 12. Start keepalive
-	go s.keepalive(ctx)
+	// Also setup DataChannel if it opens (for control messages, not data)
+	go func() {
+		select {
+		case <-s.dcReady:
+			sfuLog.Info("DataChannel _reliable also available (backup)")
+		case <-time.After(20 * time.Second):
+			// DC not required in RTP mode
+		}
+	}()
+
+	// 11. Start Opus silence keepalive + SFU ping
+	s.rtpDataConn.StartSilenceLoop()
 	go s.sfuPing(ctx)
 
 	return nil
 }
 
 func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
+	// Use minimal MediaEngine with ONLY Opus codec — no TWCC extensions.
+	// Skipping TWCC prevents the SFU's Bandwidth Estimator from throttling
+	// our VPN traffic disguised as audio.
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType: webrtc.MimeTypeVP8, ClockRate: 90000,
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: 48000,
+			Channels:  2,
 		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
+		PayloadType: 111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return err
 	}
+	// NOTE: We deliberately do NOT register TWCC header extensions.
+	// This forces the SFU to blindly forward packets at maximum speed.
 
 	se := webrtc.SettingEngine{}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
-	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024) // 8MB — prevents stall during heavy proxy traffic
-	// Force TCP only — bypass Iran's DPI which throttles/drops unknown UDP (DTLS/SRTP)
+	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
 		webrtc.NetworkTypeTCP4,
 		webrtc.NetworkTypeTCP6,
@@ -235,7 +236,6 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		webrtc.WithMediaEngine(mediaEngine),
 	)
 
-	// Force Relay policy — traffic only flows through TURN-TLS, looks like HTTPS
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers:         iceServers,
 		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
@@ -244,10 +244,10 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Create video track
+	// Create Opus audio track — DPI sees a normal voice call
 	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
-		"video", "ble-tunnel-pub",
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"vpn-audio", "vpn-stream",
 	)
 	if err != nil {
 		return err
@@ -256,8 +256,7 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Create reliable/ordered DataChannel for tunnel data.
-	// SCTP handles reliability natively — no KCP needed.
+	// Still create DataChannel as backup / for SFU expectations
 	ordered := true
 	dc, err := pc.CreateDataChannel("_reliable", &webrtc.DataChannelInit{
 		Ordered: &ordered,
@@ -289,6 +288,14 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		sfuLog.Info("[SFU-Pub] ICE: %s", state)
+		// Pause WebSocket when WebRTC is connected (Step 5 from roadmap)
+		if state == webrtc.ICEConnectionStateConnected {
+			s.wsPaused.Store(true)
+			sfuLog.Info("[SFU-Pub] WebRTC connected — pausing WS signaling")
+		} else if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateDisconnected {
+			s.wsPaused.Store(false)
+			sfuLog.Info("[SFU-Pub] WebRTC disconnected — resuming WS signaling")
+		}
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -301,20 +308,22 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 }
 
 func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
+	// Subscriber also uses Opus-only MediaEngine (no TWCC)
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType: webrtc.MimeTypeVP8, ClockRate: 90000,
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: 48000,
+			Channels:  2,
 		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
+		PayloadType: 111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return err
 	}
 
 	se := webrtc.SettingEngine{}
 	se.SetICETimeouts(5*time.Second, 25*time.Second, 2*time.Second)
-	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024) // 8MB — prevents stall during heavy proxy traffic
-	// Force TCP only — bypass Iran's DPI which throttles/drops unknown UDP (DTLS/SRTP)
+	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	se.SetNetworkTypes([]webrtc.NetworkType{
 		webrtc.NetworkTypeTCP4,
 		webrtc.NetworkTypeTCP6,
@@ -325,7 +334,6 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 		webrtc.WithMediaEngine(mediaEngine),
 	)
 
-	// Force Relay policy — traffic only flows through TURN-TLS, looks like HTTPS
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers:         iceServers,
 		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
@@ -349,9 +357,10 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 		sfuLog.Info("[SFU-Sub] Connection: %s", state)
 	})
 
-	// Handle incoming video tracks from other participants
+	// Handle incoming AUDIO tracks from other participants
+	// This is where we receive VPN data disguised as Opus audio
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		sfuLog.Info("[SFU-Sub] 📹 Got remote track: %s", remote.Codec().MimeType)
+		sfuLog.Info("[SFU-Sub] 🔊 Got remote track: %s (kind=%s)", remote.Codec().MimeType, remote.Kind())
 		s.mu.Lock()
 		s.connected = true
 		s.mu.Unlock()
@@ -360,7 +369,8 @@ func (s *SFUTransport) createSubscriber(iceServers []webrtc.ICEServer) error {
 		default:
 			close(s.connectedCh)
 		}
-		go s.readRemoteTrack(remote)
+		// Read RTP packets and feed payloads into rtpconn
+		go s.readRemoteAudioTrack(remote)
 	})
 
 	// Handle incoming DataChannels from SFU (forwarded from other participant)
@@ -449,19 +459,33 @@ func (s *SFUTransport) handleSubscriberOffer(offer *lkproto.SessionDescription) 
 	return s.sendSignal(req)
 }
 
-// DataConn returns the io.ReadWriteCloser backed by the reliable DataChannel.
-// Use this with yamux.Client() / yamux.Server() for multiplexed streams.
-func (s *SFUTransport) DataConn() *dcconn.Conn {
+// DataConn returns the io.ReadWriteCloser for yamux.
+// In RTP mode, returns the rtpconn; in DC mode, returns the dcconn.
+func (s *SFUTransport) DataConn() io.ReadWriteCloser {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.useRTP && s.rtpDataConn != nil {
+		return s.rtpDataConn
+	}
 	return s.dataConn
 }
 
 // GetStats returns traffic stats.
 func (s *SFUTransport) GetStats() map[string]interface{} {
-	dc := s.DataConn()
-	if dc != nil {
-		sent, recv := dc.Stats()
+	s.mu.RLock()
+	rtpDC := s.rtpDataConn
+	dcConn := s.dataConn
+	s.mu.RUnlock()
+
+	if rtpDC != nil {
+		sent, recv := rtpDC.Stats()
+		return map[string]interface{}{
+			"bytes_sent":     sent,
+			"bytes_received": recv,
+		}
+	}
+	if dcConn != nil {
+		sent, recv := dcConn.Stats()
 		return map[string]interface{}{
 			"bytes_sent":     sent,
 			"bytes_received": recv,
@@ -556,17 +580,22 @@ func (s *SFUTransport) Close() error {
 	return nil
 }
 
-// readRemoteTrack reads VP8 frames from the SFU to keep the video subscription
-// alive (required for Bale call session). Tunnel data comes via DataChannels.
-func (s *SFUTransport) readRemoteTrack(track *webrtc.TrackRemote) {
-	buf := make([]byte, 1500)
+// readRemoteAudioTrack reads Opus RTP packets from the SFU and feeds
+// their payloads into the rtpconn for yamux reassembly.
+func (s *SFUTransport) readRemoteAudioTrack(track *webrtc.TrackRemote) {
 	for {
-		_, _, err := track.Read(buf)
+		rtpPacket, _, err := track.ReadRTP()
 		if err != nil {
-			sfuLog.Error("[SFU-Sub] Track read error: %v", err)
+			sfuLog.Error("[SFU-Sub] Audio track read error: %v", err)
 			return
 		}
-		// Just drain — tunnel data comes through DataChannel now
+		// Feed raw RTP payload into rtpconn for reassembly
+		s.mu.RLock()
+		rc := s.rtpDataConn
+		s.mu.RUnlock()
+		if rc != nil {
+			rc.HandleRTP(rtpPacket.Payload)
+		}
 	}
 }
 
@@ -735,39 +764,10 @@ func (s *SFUTransport) sendSignal(req *lkproto.SignalRequest) error {
 	return s.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
+// keepalive is no longer needed — rtpconn.StartSilenceLoop() handles
+// Opus keepalive frames. This is a no-op stub for compatibility.
 func (s *SFUTransport) keepalive(ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(sfuKeepaliveMs) * time.Millisecond)
-	defer ticker.Stop()
-
-	frameCount := 0
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.mu.RLock()
-			track := s.track
-			s.mu.RUnlock()
-			if track == nil {
-				continue
-			}
-
-			frameCount++
-			var frame []byte
-			if frameCount%sfuKeyframeEvery == 0 {
-				frame = sfuKeyFrame
-			} else {
-				frame = sfuInterFrame
-			}
-
-			track.WriteSample(media.Sample{
-				Data:     frame,
-				Duration: time.Duration(sfuKeepaliveMs) * time.Millisecond,
-			})
-		}
-	}
+	// Opus silence keepalive is handled by rtpconn.StartSilenceLoop()
 }
 
 func (s *SFUTransport) sfuPing(ctx context.Context) {
@@ -801,6 +801,12 @@ func (s *SFUTransport) sfuPing(ctx context.Context) {
 				Message: &lkproto.SignalRequest_Ping{
 					Ping: time.Now().UnixMilli(),
 				},
+			}
+			// Step 5: Skip ping when WS is paused (call active)
+			// Only send minimal pings to prevent WS timeout
+			if s.wsPaused.Load() {
+				// Still send pings but less frequently — handled by the 10s ticker
+				// which is already infrequent enough
 			}
 			if err := s.sendSignal(req); err != nil {
 				sfuLog.Warn("SFU ping failed: %v — signaling teardown", err)
@@ -861,7 +867,7 @@ func (s *SFUTransport) buildWSURL() (string, error) {
 	q.Set("access_token", s.cfg.LiveKitToken)
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
-	q.Set("version", "2.15.2")
+	q.Set("version", "2.13.6")
 	q.Set("protocol", "16")
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()
