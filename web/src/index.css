@@ -1,0 +1,179 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-dark-900: #030712;
+  --color-dark-800: #0a0f1e;
+  --color-dark-700: #111827;
+  --color-dark-600: #1a2236;
+  --color-dark-500: #1e293b;
+  --color-dark-400: #293548;
+  --color-dark-300: #334155;
+  --color-glass: rgba(17, 24, 39, 0.65);
+  --color-glass-border: rgba(99, 102, 241, 0.12);
+  --color-glass-hover: rgba(99, 102, 241, 0.22);
+  --color-light-50: #f8fafc;
+  --color-light-100: #f1f5f9;
+  --color-light-200: #e2e8f0;
+  --color-light-300: #cbd5e1;
+  --color-light-400: #94a3b8;
+  --color-light-glass: rgba(255, 255, 255, 0.75);
+  --color-light-glass-border: rgba(0, 0, 0, 0.06);
+  --color-light-glass-hover: rgba(0, 0, 0, 0.1);
+  --font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ====== Dark Mode (default) ====== */
+[data-mode="dark"] body {
+  background: var(--color-dark-900);
+  color: #f1f5f9;
+}
+
+/* ====== Light Mode ====== */
+[data-mode="light"] body {
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+/* ====== Scrollbar ====== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+[data-mode="dark"] ::-webkit-scrollbar-thumb { background: hsl(var(--theme-hue) 50% 50% / 0.25); border-radius: 3px; }
+[data-mode="light"] ::-webkit-scrollbar-thumb { background: hsl(var(--theme-hue) 40% 70% / 0.35); border-radius: 3px; }
+
+/* ====== Glass Cards — Dark ====== */
+[data-mode="dark"] .glass {
+  background: rgba(17, 24, 39, 0.65);
+  backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid hsl(var(--theme-hue) 50% 50% / 0.12);
+}
+[data-mode="dark"] .glass:hover {
+  border-color: hsl(var(--theme-hue) 50% 50% / 0.25);
+}
+
+/* ====== Glass Cards — Light ====== */
+[data-mode="light"] .glass {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.02);
+}
+[data-mode="light"] .glass:hover {
+  border-color: hsl(var(--theme-hue) 50% 50% / 0.2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.04);
+}
+
+/* ====== Gradient text ====== */
+[data-mode="dark"] .gradient-text {
+  background: linear-gradient(135deg, hsl(var(--theme-hue) 80% 85%), hsl(var(--theme-hue) 70% 65%));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+[data-mode="light"] .gradient-text {
+  background: linear-gradient(135deg, hsl(var(--theme-hue) 70% 40%), hsl(var(--theme-hue) 60% 50%));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ====== Accent gradient button ====== */
+.btn-accent {
+  background: linear-gradient(135deg, hsl(var(--theme-hue) 70% 55%), hsl(calc(var(--theme-hue) + 20) 60% 55%));
+  color: white;
+  box-shadow: 0 4px 16px hsl(var(--theme-hue) 60% 50% / 0.3);
+}
+.btn-accent:hover {
+  box-shadow: 0 6px 24px hsl(var(--theme-hue) 60% 50% / 0.45);
+  transform: translateY(-1px);
+}
+
+/* ====== Accent outline ====== */
+.ring-accent { border-color: hsl(var(--theme-hue) 60% 50% / 0.25) !important; }
+.ring-accent-strong { border-color: hsl(var(--theme-hue) 60% 50% / 0.5) !important; }
+.bg-accent-subtle { background: hsl(var(--theme-hue) 60% 50% / 0.1); }
+.text-accent { color: var(--theme-accent-light); }
+
+/* ====== Nav active — uses theme color ====== */
+[data-mode="dark"] .nav-active {
+  background: hsl(var(--theme-hue) 60% 50% / 0.12);
+  color: hsl(var(--theme-hue) 70% 75%);
+  border: 1px solid hsl(var(--theme-hue) 60% 50% / 0.2);
+}
+[data-mode="light"] .nav-active {
+  background: hsl(var(--theme-hue) 60% 50% / 0.08);
+  color: hsl(var(--theme-hue) 60% 40%);
+  border: 1px solid hsl(var(--theme-hue) 60% 50% / 0.15);
+}
+
+/* ====== Stat card top bar ====== */
+.stat-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, hsl(var(--theme-hue) 70% 55%), hsl(calc(var(--theme-hue) + 30) 60% 60%));
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.stat-bar:hover::before { opacity: 1; }
+
+/* ====== Pulse dot ====== */
+@keyframes livePulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+}
+.animate-live-pulse { animation: livePulse 2s infinite; }
+
+/* ====== Sidebar — Dark ====== */
+[data-mode="dark"] .sidebar-bg {
+  background: rgba(10, 15, 30, 0.85);
+  border-right: 1px solid hsl(var(--theme-hue) 50% 50% / 0.1);
+}
+/* ====== Sidebar — Light ====== */
+[data-mode="light"] .sidebar-bg {
+  background: rgba(255, 255, 255, 0.82);
+  border-right: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+/* ====== Inputs — Light ====== */
+[data-mode="light"] .input-themed {
+  background: rgba(0, 0, 0, 0.03);
+  border-color: rgba(0, 0, 0, 0.1);
+  color: #0f172a;
+}
+[data-mode="light"] .input-themed:focus {
+  border-color: hsl(var(--theme-hue) 60% 50% / 0.4);
+  box-shadow: 0 0 0 3px hsl(var(--theme-hue) 60% 50% / 0.1);
+}
+[data-mode="dark"] .input-themed {
+  background: rgba(30, 41, 59, 0.6);
+  border-color: hsl(var(--theme-hue) 50% 50% / 0.12);
+  color: #e2e8f0;
+}
+[data-mode="dark"] .input-themed:focus {
+  border-color: hsl(var(--theme-hue) 60% 50% / 0.4);
+  box-shadow: 0 0 0 3px hsl(var(--theme-hue) 60% 50% / 0.15);
+}
+
+/* ====== Modal overlay ====== */
+[data-mode="dark"] .modal-overlay-bg { background: rgba(0, 0, 0, 0.6); }
+[data-mode="light"] .modal-overlay-bg { background: rgba(0, 0, 0, 0.25); }
+
+/* ====== Table ====== */
+[data-mode="dark"] .table-border { border-color: hsl(var(--theme-hue) 50% 50% / 0.08); }
+[data-mode="light"] .table-border { border-color: rgba(0, 0, 0, 0.05); }
+[data-mode="dark"] .table-row-hover:hover { background: hsl(var(--theme-hue) 50% 50% / 0.04); }
+[data-mode="light"] .table-row-hover:hover { background: hsl(var(--theme-hue) 60% 50% / 0.03); }
+
+/* ====== Theme color swatch ====== */
+.theme-swatch {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 2px solid transparent;
+}
+.theme-swatch:hover { transform: scale(1.1); }
+.theme-swatch.active { border-color: white; box-shadow: 0 0 16px hsl(var(--theme-hue) 60% 50% / 0.4); }
