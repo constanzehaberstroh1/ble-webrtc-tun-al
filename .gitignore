@@ -9,7 +9,7 @@ data/
 node_modules/
 web/node_modules/
 web/dist/
-package.json
+#package.json
 package-lock.json
 
 # Embedded UI dist is committed (it's embedded into the Go binary)
