@@ -19,6 +19,7 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
+	"github.com/salman/ble-webrtc-tun/internal/kcptun"
 	"github.com/salman/ble-webrtc-tun/internal/rtpconn"
 	"google.golang.org/protobuf/proto"
 
@@ -51,6 +52,7 @@ type SFUTransport struct {
 
 	// RTP audio tunnel (primary — DPI evasion)
 	rtpDataConn *rtpconn.Conn    // io.ReadWriteCloser for yamux (RTP mode)
+	kcpConn     *kcptun.Conn     // KCP reliability wrapper
 	useRTP      bool             // true = tunnel via Opus RTP, false = DC fallback
 
 	// Obfuscation layer (anti-DPI)
@@ -439,10 +441,14 @@ func (s *SFUTransport) handleSubscriberOffer(offer *lkproto.SessionDescription) 
 // DataConn returns the io.ReadWriteCloser for yamux.
 // In RTP mode, returns the rtpconn; in DC mode, returns the dcconn.
 func (s *SFUTransport) DataConn() io.ReadWriteCloser {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.useRTP && s.rtpDataConn != nil {
-		return s.rtpDataConn
+		if s.kcpConn == nil {
+			sfuLog.Info("Wrapping RTP connection with KCP reliability layer")
+			s.kcpConn = kcptun.Wrap(s.rtpDataConn)
+		}
+		return s.kcpConn
 	}
 	return s.dataConn
 }
@@ -550,6 +556,9 @@ func (s *SFUTransport) Close() error {
 	}
 	if s.subPC != nil {
 		s.subPC.Close()
+	}
+	if s.kcpConn != nil {
+		s.kcpConn.Close()
 	}
 	if s.conn != nil {
 		s.conn.Close()

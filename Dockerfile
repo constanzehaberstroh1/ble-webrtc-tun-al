@@ -1,18 +1,5 @@
 # ============================================
-# Stage 1 — Build frontend (Node.js)
-# ============================================
-FROM node:20-alpine AS frontend
-
-WORKDIR /app/web
-
-COPY web/package.json web/package-lock.json ./
-RUN npm ci
-
-COPY web/ ./
-RUN npm run build
-
-# ============================================
-# Stage 2 — Build Go binary
+# Stage 1 — Build Go binary
 # ============================================
 FROM golang:1.25-alpine AS builder
 
@@ -25,14 +12,18 @@ RUN go mod download
 
 COPY . .
 
-# Copy built frontend into the embedded webui directory
-COPY --from=frontend /app/web/dist /app/internal/webui/dist
+# Copy the pre-built static assets from the local repository
+# directly into the embed path. Since internal/webui/dist is
+# already checked in, this ensures the web UI is bundled successfully
+# without requiring a memory-intensive Node build stage on Clever Cloud.
+RUN mkdir -p /app/internal/webui/dist && \
+    cp -r /app/web/dist/* /app/internal/webui/dist/ 2>/dev/null || true
 
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" \
     -o /app/bin/server ./cmd/server
 
 # ============================================
-# Stage 3 — Runtime (lightweight Alpine)
+# Stage 2 — Runtime (lightweight Alpine)
 # ============================================
 FROM alpine:3.21
 
