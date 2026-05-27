@@ -10,7 +10,7 @@ node_modules/
 web/node_modules/
 web/dist/
 #package.json
-package-lock.json
+#package-lock.json
 
 # Embedded UI dist is committed (it's embedded into the Go binary)
 # Run `make build-web` to update it before committing
