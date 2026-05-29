@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -202,7 +201,9 @@ func runBaleSignaling(ctx context.Context, cfg *config.Config, adminPanel *admin
 		})
 		for i, acct := range serverAccounts {
 			if i > 0 {
-				time.Sleep(time.Duration(i*3+rand.Intn(4)) * time.Second)
+				// Sequential stagger: consistent 3s between accounts
+				// Avoids overwhelming Bale's WS infrastructure
+				time.Sleep(3 * time.Second)
 			}
 			startAccount(acct)
 		}
@@ -692,12 +693,13 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	}
 
 	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                     // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 30 * time.Second       // Relaxed ping interval for KCP latency
-	ymuxCfg.ConnectionWriteTimeout = 20 * time.Second   // Tolerant of relay RTT
+	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
+	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (match client)
+	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (match client)
 	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 1024 * 1024          // 1MB — safer for SFU relay
-	ymuxCfg.LogOutput = io.Discard                     // Silence yamux internal logs
+	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — must match client (was 1MB)
+	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
+	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
 
 	session, err := yamux.Server(dc, ymuxCfg)
 	if err != nil {

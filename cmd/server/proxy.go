@@ -29,6 +29,8 @@ func handleStream(stream net.Conn) {
 	defer stream.Close()
 
 	// Read target address: [2 bytes len][addr]
+	// Set a deadline for reading the header to avoid stuck streams
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
 		return
@@ -42,22 +44,35 @@ func handleStream(stream net.Conn) {
 		return
 	}
 	addr := string(addrBuf)
+	// Clear the header deadline
+	stream.SetReadDeadline(time.Time{})
 
 	mainLog.Info("Proxy: CONNECT %s", addr)
 
-	// Connect to real destination
-	conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	// Connect to real destination with reasonable timeout
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		mainLog.Error("Proxy: dial %s: %v", addr, err)
 		return
 	}
 	defer conn.Close()
 
+	// Enable TCP keepalive on outbound connections to detect dead peers
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	// Bidirectional relay using 256KB buffers (reduces syscall overhead over TURN relay)
+	// Use proper half-close: when one direction finishes, signal the other side
 	done := make(chan struct{}, 2)
 	go func() {
 		buf := make([]byte, 256*1024)
 		io.CopyBuffer(conn, stream, buf)
+		// Half-close: signal to the remote server that we're done sending
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 	go func() {
@@ -67,3 +82,4 @@ func handleStream(stream net.Conn) {
 	}()
 	<-done
 }
+
