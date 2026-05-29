@@ -55,11 +55,10 @@ func NewTunnel(convID uint32, sendFn func([]byte) error, recvFn func([]byte)) *T
 	// - NC=1: disable congestion control (we manage bandwidth externally)
 	t.kcp.NoDelay(1, 10, 2, 1)
 
-	// Set window sizes (in packets) — large window for high-latency TURN-TLS path
-	t.kcp.WndSize(1024, 1024)
+	// Set window sizes (in packets) — large window for high-bandwidth WAN paths
+	t.kcp.WndSize(2048, 2048)
 
-	// Maximum segment size: SCTP handles chunking, no VP8 overhead
-	// TUN MTU=1000, KCP header=24 → set slightly above TUN MTU
+	// Maximum segment size: matches kcpconn.go for consistency
 	t.kcp.SetMtu(1100)
 
 	// Start update loop

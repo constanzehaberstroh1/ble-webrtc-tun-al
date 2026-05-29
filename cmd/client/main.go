@@ -683,61 +683,70 @@ func (tm *TunnelManager) Start() error {
 func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.TunnelPool, pairs []config.TokenPair) {
 	var channels []*channelState
 	var mu sync.Mutex
-	var wg sync.WaitGroup
 	var proxyOnce sync.Once
 
+	// === SEQUENTIAL CONNECTION ===
+	// Connect pairs ONE AT A TIME to avoid overwhelming Bale's SFU.
+	// Each pair waits for the previous to fully connect or fail before starting.
+	// This respects Bale's rate limiting and prevents signaling races.
 	for i, pair := range pairs {
-		wg.Add(1)
-		go func(idx int, tp config.TokenPair) {
-			defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 
-			label := fmt.Sprintf("ch%d", tp.Index)
+		label := fmt.Sprintf("ch%d", pair.Index)
 
-			// Randomized stagger: 3-7s per channel with jitter
-			if idx > 0 {
-				tm.setChannelPhase(idx, PhaseInit, "")
-				base := time.Duration(3000+idx*2000) * time.Millisecond
-				jitter := time.Duration(rand.Intn(4000)) * time.Millisecond
-				delay := base + jitter
-				mainLog.Info("[%s] Waiting %.1fs before init...", label, delay.Seconds())
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(delay):
-				}
-			}
-
-			// Track phases through initChannel
-			tm.setChannelPhase(idx, PhaseBaleConnect, "")
-			ch, session := tm.initChannelTracked(ctx, idx, tp, label)
-			if ch == nil || session == nil {
-				mainLog.Info("[%s] ❌ Channel init failed — skipping", label)
+		// Small stagger between pairs (2-4s) — enough for Bale to process
+		// without triggering anti-spam, but much faster than the old 8-10s.
+		if i > 0 {
+			tm.setChannelPhase(i, PhaseInit, "")
+			delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
+			mainLog.Info("[%s] Waiting %.1fs before connecting (sequential)...", label, delay.Seconds())
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(delay):
 			}
+		}
 
-			tm.setChannelPhase(idx, PhaseTunnelActive, "")
-			tunnelPool.Add(session, label)
-			mu.Lock()
-			channels = append(channels, ch)
-			mu.Unlock()
-			mainLog.Info("[%s] ✅ Channel ready!", label)
+		// Track phases through initChannel
+		tm.setChannelPhase(i, PhaseBaleConnect, "")
+		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (sequential)...", label, i+1, len(pairs))
 
-			// Start proxies on all interfaces as soon as first channel connects
-			proxyOnce.Do(func() {
-				go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-				go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-				mainLog.Info(" ✅ Proxies started on ALL interfaces (first channel ready)!")
-				for _, ip := range getLocalIPs() {
-					mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-				}
-			})
+		ch, session := tm.initChannelTracked(ctx, i, pair, label)
+		if ch == nil || session == nil {
+			mainLog.Warn("[%s] ❌ Channel init failed — continuing to next pair", label)
+			// Brief cooldown after failure before trying next pair
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
 
-			// Monitor this channel for death and auto-reconnect
-			go tm.monitorAndReconnect(ctx, tunnelPool, ch, session, idx, tp, label, &mu, &channels, &proxyOnce)
-		}(i, pair)
+		tm.setChannelPhase(i, PhaseTunnelActive, "")
+		tunnelPool.Add(session, label)
+		mu.Lock()
+		channels = append(channels, ch)
+		mu.Unlock()
+		mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
+
+		// Start proxies on all interfaces as soon as first channel connects
+		proxyOnce.Do(func() {
+			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
+			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+			mainLog.Info(" ✅ Proxies started on ALL interfaces (first channel ready)!")
+			for _, ip := range getLocalIPs() {
+				mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+			}
+		})
+
+		// Monitor this channel for death and auto-reconnect
+		go tm.monitorAndReconnect(ctx, tunnelPool, ch, session, i, pair, label, &mu, &channels, &proxyOnce)
 	}
-
-	wg.Wait()
 
 	if ctx.Err() != nil {
 		return
@@ -825,8 +834,8 @@ func (tm *TunnelManager) monitorAndReconnect(
 	channels *[]*channelState,
 	proxyOnce *sync.Once,
 ) {
-	backoff := 5 * time.Second
-	const maxBackoff = 60 * time.Second
+	backoff := 3 * time.Second
+	const maxBackoff = 30 * time.Second
 
 	currentSession := session
 	currentCh := ch
@@ -836,10 +845,15 @@ func (tm *TunnelManager) monitorAndReconnect(
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(15 * time.Second):
-			// Check session health — 15s tolerance for WebRTC jitter
+		case <-time.After(10 * time.Second):
+			// Check session health proactively using yamux Ping
+			// This detects dead connections faster than waiting for IsClosed()
 			if currentSession != nil && !currentSession.IsClosed() {
-				continue
+				_, err := currentSession.Ping()
+				if err == nil {
+					continue // Session is alive
+				}
+				mainLog.Warn("[%s] Yamux ping failed: %v — treating as dead", label, err)
 			}
 		}
 
@@ -913,6 +927,13 @@ func (tm *TunnelManager) monitorAndReconnect(
 			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
 			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
 		})
+
+		// Brief stabilization pause before resuming monitoring
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -997,12 +1018,13 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	}
 
 	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                     // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 30 * time.Second       // Relaxed ping interval for KCP latency
-	ymuxCfg.ConnectionWriteTimeout = 20 * time.Second   // Tolerant of relay RTT
+	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
+	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (was 30s)
+	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (was 20s)
 	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 1024 * 1024          // 1MB — safer for SFU relay
-	ymuxCfg.LogOutput = io.Discard                     // Silence yamux internal logs
+	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads (was 1MB)
+	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections (was default 256)
+	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
 
 	session, err := yamux.Client(dc, ymuxCfg)
 	if err != nil {
@@ -1099,11 +1121,13 @@ func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPai
 	}
 
 	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = false                    // Let SCTP/WebRTC handle connection health
-	ymuxCfg.ConnectionWriteTimeout = 120 * time.Second // Safety valve for stuck writes
+	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
+	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection
+	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission
 	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 1024 * 1024          // 1MB — safer for SFU relay
-	ymuxCfg.LogOutput = io.Discard                     // Silence yamux internal logs
+	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads
+	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
+	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
 
 	session, err := yamux.Client(dc, ymuxCfg)
 	if err != nil {

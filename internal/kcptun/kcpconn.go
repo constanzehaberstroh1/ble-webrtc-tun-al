@@ -52,7 +52,7 @@ func WrapWithSecret(underlying io.ReadWriteCloser, secret string) *Conn {
 
 	c := &Conn{
 		underlying: underlying,
-		readCh:     make(chan []byte, 4096),
+		readCh:     make(chan []byte, 8192), // Large buffer for streaming/downloads
 		done:       make(chan struct{}),
 	}
 
@@ -63,18 +63,21 @@ func WrapWithSecret(underlying io.ReadWriteCloser, secret string) *Conn {
 		}
 	})
 
-	// Tune KCP for ultra-low-latency and robust delivery over a lossy SFU:
+	// Tune KCP for maximum throughput over a lossy, high-latency SFU relay:
 	// - NoDelay=1: disable delayed ACK
 	// - Interval=10ms: fast update interval
 	// - Resend=2: fast resend on 2 duplicate ACKs
 	// - NC=1: disable congestion control (we manage bandwidth externally)
 	c.kcp.NoDelay(1, 10, 2, 1)
 
-	// Set window sizes (in packets) — generous to handle latency spikes
-	c.kcp.WndSize(256, 256)
+	// Large window sizes (in packets) — critical for high-bandwidth downloads.
+	// With MTU=1100 and window=2048: up to ~2.2MB in-flight data.
+	// Previous value of 256 caused deadlocks during streaming.
+	c.kcp.WndSize(2048, 2048)
 
-	// Max segment size: MTU of Opus payloads is typically ~1200
-	c.kcp.SetMtu(1000)
+	// Max segment size: match the Opus RTP payload capacity.
+	// rtpconn uses maxPlainChunkSize=1160 (minus obfuscation overhead).
+	c.kcp.SetMtu(1100)
 
 	// Start threads
 	go c.updateLoop()
@@ -156,7 +159,7 @@ func (c *Conn) updateLoop() {
 // readLoop pulls lossy packets from the underlying connection, feeds them to KCP,
 // and extracts complete, ordered payloads.
 func (c *Conn) readLoop() {
-	buf := make([]byte, 2048)
+	buf := make([]byte, 4096) // Larger read buffer for high-throughput
 	for {
 		select {
 		case <-c.done:
