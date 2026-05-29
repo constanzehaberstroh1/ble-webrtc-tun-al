@@ -2,6 +2,11 @@
 // BLE WebRTC Tunnel. Each component gets its own log file under the logs/
 // directory, while all logs are also written to stdout and a combined log.
 //
+// The logger is fully asynchronous — log calls never block the caller.
+// A background goroutine handles file I/O, ring-buffer storage, and
+// WebSocket broadcast to connected UI clients. This ensures zero impact
+// on tunnel throughput and connection stability.
+//
 // Usage:
 //
 //	l := logger.New("bale")       // creates logs/<role>/bale.log
@@ -85,6 +90,14 @@ type LogEntry struct {
 	Message   string `json:"message"`
 }
 
+// Subscriber receives log entries via a buffered channel.
+// Used by WebSocket handlers to stream logs to the UI in real-time.
+type Subscriber struct {
+	Ch        chan LogEntry
+	Level     Level  // minimum level filter (0 = all)
+	Component string // component filter ("" = all)
+}
+
 // Global state
 var (
 	mu       sync.Mutex
@@ -96,18 +109,35 @@ var (
 	minLevel = INFO
 	colorOut = true
 
-	// Memory buffer for UI streaming
-	logBuffer []LogEntry
-	logBufferMu sync.RWMutex
-	maxLogBuffer = 1000
+	// Async pipeline: all log entries are sent here without blocking.
+	// The background goroutine drains this channel.
+	asyncCh chan asyncEntry
+
+	// Ring buffer for recent log history (read by REST API).
+	ringBuf   []LogEntry
+	ringMu    sync.RWMutex
+	ringSize  = 5000 // keep last 5000 entries in memory
+
+	// WebSocket subscribers — background goroutine fans out to them.
+	subsMu sync.RWMutex
+	subs   = make(map[*Subscriber]struct{})
 )
 
-// GetLogs returns up to the last n log entries.
-func GetLogs(n int) []LogEntry {
-	logBufferMu.RLock()
-	defer logBufferMu.RUnlock()
+// asyncEntry is the internal message type for the async pipeline.
+type asyncEntry struct {
+	entry    LogEntry
+	level    Level
+	fileLog  *log.Logger
+	fileLine string // pre-formatted line for component log file
+}
 
-	l := len(logBuffer)
+// GetLogs returns up to the last n log entries from the ring buffer.
+// Optionally filters by level and component.
+func GetLogs(n int) []LogEntry {
+	ringMu.RLock()
+	defer ringMu.RUnlock()
+
+	l := len(ringBuf)
 	if l == 0 {
 		return nil
 	}
@@ -116,13 +146,76 @@ func GetLogs(n int) []LogEntry {
 	}
 
 	res := make([]LogEntry, n)
-	copy(res, logBuffer[l-n:])
+	copy(res, ringBuf[l-n:])
 	return res
 }
 
+// GetFilteredLogs returns recent log entries filtered by level and/or component.
+func GetFilteredLogs(n int, levelFilter string, componentFilter string) []LogEntry {
+	ringMu.RLock()
+	defer ringMu.RUnlock()
+
+	levelFilter = strings.ToUpper(levelFilter)
+	componentFilter = strings.ToUpper(componentFilter)
+
+	var result []LogEntry
+	for i := len(ringBuf) - 1; i >= 0 && len(result) < n; i-- {
+		e := ringBuf[i]
+		if levelFilter != "" && e.Level != levelFilter {
+			continue
+		}
+		if componentFilter != "" && e.Component != componentFilter {
+			continue
+		}
+		result = append(result, e)
+	}
+
+	// Reverse to chronological order
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+	return result
+}
+
+// GetLogDir returns the current log directory path.
+func GetLogDir() string {
+	mu.Lock()
+	defer mu.Unlock()
+	return logDir
+}
+
+// GetRole returns the current role (server/client).
+func GetRole() string {
+	mu.Lock()
+	defer mu.Unlock()
+	return role
+}
+
+// Subscribe registers a new WebSocket subscriber for live log streaming.
+// The caller must call Unsubscribe when done (e.g. on WebSocket close).
+func Subscribe(level Level, component string) *Subscriber {
+	s := &Subscriber{
+		Ch:        make(chan LogEntry, 256),
+		Level:     level,
+		Component: strings.ToUpper(component),
+	}
+	subsMu.Lock()
+	subs[s] = struct{}{}
+	subsMu.Unlock()
+	return s
+}
+
+// Unsubscribe removes a subscriber and closes its channel.
+func Unsubscribe(s *Subscriber) {
+	subsMu.Lock()
+	delete(subs, s)
+	subsMu.Unlock()
+	// Don't close the channel — the sender (background goroutine) uses select/default.
+}
+
 // Init initializes the logging system for the given role.
-// Must be called once at startup. Loggers created before Init() will
-// retroactively get their log files opened.
+// Must be called once at startup. Starts the background async writer goroutine.
+// Loggers created before Init() will retroactively get their log files opened.
 func Init(r string) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -167,6 +260,13 @@ func Init(r string) error {
 		}
 		l.combLog = combLog
 	}
+
+	// Initialize the async pipeline
+	asyncCh = make(chan asyncEntry, 8192)
+	ringBuf = make([]LogEntry, 0, ringSize)
+
+	// Start background writer goroutine
+	go asyncWriter()
 
 	return nil
 }
@@ -226,8 +326,20 @@ func New(component string) *Logger {
 	return l
 }
 
-// Close closes all open log files. Call at shutdown.
+// Close drains the async pipeline and closes all open log files. Call at shutdown.
 func Close() {
+	// Signal the async writer to stop by closing the channel
+	mu.Lock()
+	ch := asyncCh
+	asyncCh = nil
+	mu.Unlock()
+
+	if ch != nil {
+		close(ch)
+		// Give the writer a moment to drain
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -266,6 +378,9 @@ func (l *Logger) Error(format string, args ...interface{}) { l.log(ERROR, format
 
 func (l *Logger) Fatal(format string, args ...interface{}) {
 	l.log(FATAL, format, args...)
+	// For Fatal, we need to ensure the message is written before exit.
+	// Give the async writer a moment to process.
+	time.Sleep(50 * time.Millisecond)
 	os.Exit(1)
 }
 
@@ -278,20 +393,8 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 	ts := time.Now().Format("2006/01/02 15:04:05.000")
 	tag := strings.ToUpper(l.component)
 
-	// File format: timestamp [LEVEL] [COMPONENT] message
+	// Stdout is written synchronously (it's fast and expected to be immediate)
 	fileLine := fmt.Sprintf("%s [%-5s] [%s] %s", ts, level.String(), tag, msg)
-
-	// Write to component-specific log file
-	if l.fileLog != nil {
-		l.fileLog.Output(2, fmt.Sprintf("[%-5s] [%s] %s", level.String(), tag, msg))
-	}
-
-	// Write to combined log
-	if l.combLog != nil {
-		l.combLog.Output(2, fmt.Sprintf("[%-5s] [%s] %s", level.String(), tag, msg))
-	}
-
-	// Write to stdout (with optional color)
 	if colorOut {
 		color := levelColors[level]
 		reset := "\033[0m"
@@ -305,18 +408,79 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 		l.stdLog.Print(fileLine)
 	}
 
-	// Add to memory buffer for UI
-	logBufferMu.Lock()
-	logBuffer = append(logBuffer, LogEntry{
-		Timestamp: ts,
-		Level:     level.String(),
-		Component: tag,
-		Message:   msg,
-	})
-	if len(logBuffer) > maxLogBuffer {
-		logBuffer = logBuffer[1:]
+	// Everything else (file I/O, ring buffer, WebSocket broadcast) is async.
+	entry := asyncEntry{
+		entry: LogEntry{
+			Timestamp: ts,
+			Level:     level.String(),
+			Component: tag,
+			Message:   msg,
+		},
+		level:    level,
+		fileLog:  l.fileLog,
+		fileLine: fmt.Sprintf("[%-5s] [%s] %s", level.String(), tag, msg),
 	}
-	logBufferMu.Unlock()
+
+	// Non-blocking send to async pipeline. If the channel is full,
+	// we drop the entry rather than blocking the caller — connection
+	// stability and speed are the top priority.
+	ch := asyncCh
+	if ch != nil {
+		select {
+		case ch <- entry:
+		default:
+			// Channel full — drop this log entry to avoid blocking.
+			// This should only happen under extreme load.
+		}
+	}
+}
+
+// asyncWriter is the background goroutine that processes all log entries.
+// It handles file I/O, ring buffer management, and WebSocket fan-out.
+// This runs in a single goroutine to avoid contention.
+func asyncWriter() {
+	for entry := range asyncCh {
+		// Write to component-specific log file
+		if entry.fileLog != nil {
+			entry.fileLog.Output(2, entry.fileLine)
+		}
+
+		// Write to combined log
+		mu.Lock()
+		cl := combLog
+		mu.Unlock()
+		if cl != nil {
+			cl.Output(2, entry.fileLine)
+		}
+
+		// Append to ring buffer
+		ringMu.Lock()
+		ringBuf = append(ringBuf, entry.entry)
+		if len(ringBuf) > ringSize {
+			// Trim 20% when full to avoid trimming on every entry
+			trim := ringSize / 5
+			ringBuf = append(ringBuf[:0:0], ringBuf[trim:]...)
+		}
+		ringMu.Unlock()
+
+		// Fan out to WebSocket subscribers (non-blocking)
+		subsMu.RLock()
+		for s := range subs {
+			// Apply subscriber filters
+			if entry.level < s.Level {
+				continue
+			}
+			if s.Component != "" && entry.entry.Component != s.Component {
+				continue
+			}
+			select {
+			case s.Ch <- entry.entry:
+			default:
+				// Subscriber is slow — skip this entry for them
+			}
+		}
+		subsMu.RUnlock()
+	}
 }
 
 // logWriter adapts the Logger to io.Writer for compatibility.

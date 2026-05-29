@@ -136,8 +136,11 @@ func (s *Server) registerRoutes() {
 	// Guide
 	s.mux.HandleFunc("/api/guide", s.handleGuide)
 	
-	// System logs (for UI floating console)
+	// System logs (REST + WebSocket streaming + file management)
 	s.mux.HandleFunc("/api/logs", s.handleLogs)
+	s.mux.HandleFunc("/api/logs/ws", s.handleLogsWS)
+	s.mux.HandleFunc("/api/logs/files", s.handleLogFiles)
+	s.mux.HandleFunc("/api/logs/download", s.handleLogDownload)
 
 	// Auth
 	s.mux.HandleFunc("/api/login", s.handleLogin)
@@ -310,7 +313,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			// For WebSocket endpoints: extract auth from ?auth= query parameter.
 			// WebSocket subprotocols can't contain spaces, so the frontend
 			// passes 'Basic base64(user:pass)' as a URL-encoded query param.
-			if r.URL.Path == "/api/terminal/ws" {
+			if r.URL.Path == "/api/terminal/ws" || r.URL.Path == "/api/logs/ws" {
 				if authParam := r.URL.Query().Get("auth"); authParam != "" {
 					r.Header.Set("Authorization", authParam)
 					user, pass, ok = r.BasicAuth()

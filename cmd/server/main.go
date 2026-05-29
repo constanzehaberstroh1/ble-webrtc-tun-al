@@ -833,6 +833,7 @@ func handleBaleProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.
 
 	// STEP 2: Create a fresh WebRTC transport for this session
 	newWrtc := transport.NewWebRTCTransport(cfg)
+	newWrtc.SetObfuscator(serverObf)
 	defer func() {
 		mainLog.Info("%s Closing WebRTC transport", tag)
 		newWrtc.Close()
@@ -957,6 +958,7 @@ func handleWithProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.
 	adminPanel.AddLog("info", "Processing client SDP offer (Proxy mode)...")
 
 	newWrtc := transport.NewWebRTCTransport(cfg)
+	newWrtc.SetObfuscator(serverObf)
 	defer newWrtc.Close()
 
 	iceServers := lkClient.GetICEServers()

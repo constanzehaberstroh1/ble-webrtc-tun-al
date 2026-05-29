@@ -12,6 +12,7 @@ import { ConnectionsPage } from './components/pages/ConnectionsPage'
 import { SettingsPage } from './components/pages/SettingsPage'
 import { GuidePage } from './components/pages/GuidePage'
 import { TerminalPage } from './components/pages/TerminalPage'
+import { LogsPage } from './components/pages/LogsPage'
 import { LoginPage } from './components/pages/LoginPage'
 import { loadAuth } from './api'
 
@@ -77,6 +78,16 @@ const terminalRoute = createRoute({
   },
 })
 
+// Logs
+const logsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/logs',
+  component: LogsPage,
+  beforeLoad: () => {
+    if (!loadAuth()) throw redirect({ to: '/login' })
+  },
+})
+
 // Guide
 const guideRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -105,6 +116,7 @@ const routeTree = rootRoute.addChildren([
   pairingsRoute,
   connectionsRoute,
   terminalRoute,
+  logsRoute,
   guideRoute,
   settingsRoute,
 ])

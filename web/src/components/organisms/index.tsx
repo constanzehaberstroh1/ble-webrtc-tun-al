@@ -12,6 +12,7 @@ import {
   BookOutlined,
   CloudSyncOutlined,
   CodeOutlined,
+  FileSearchOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
 } from '@ant-design/icons';
@@ -26,6 +27,7 @@ const NAV_ITEMS = [
   { path: '/pairings', icon: <LinkOutlined />, label: 'Pairings' },
   { path: '/connections', icon: <HistoryOutlined />, label: 'History' },
   { path: '/terminal', icon: <CodeOutlined />, label: 'Terminal' },
+  { path: '/logs', icon: <FileSearchOutlined />, label: 'Logs' },
   { path: '/guide', icon: <BookOutlined />, label: 'Guide' },
   { path: '/settings', icon: <SettingOutlined />, label: 'Settings' },
 ];

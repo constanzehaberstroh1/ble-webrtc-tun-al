@@ -1,7 +1,8 @@
 // Package rtpconn wraps a Pion WebRTC Opus audio track pair into an
 // io.ReadWriteCloser suitable for use with yamux. VPN data bytes are
-// written directly as Opus RTP sample payloads, and received directly
-// from ReadRTP payloads. DPI sees a normal Opus voice call.
+// encrypted with XChaCha20-Poly1305, then written as Opus RTP sample
+// payloads. Incoming RTP payloads are decrypted before delivery.
+// DPI sees a normal Opus voice call; the SFU sees opaque audio data.
 //
 // No framing is added — yamux provides its own reliable framing layer
 // on top of this raw byte pipe.
@@ -16,6 +17,7 @@ import (
 
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/salman/ble-webrtc-tun/internal/dcconn"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 )
 
@@ -23,8 +25,8 @@ var rtpLog = logger.New("rtpconn")
 
 const (
 	// maxChunkSize is the max payload per RTP Opus sample.
-	// Keep under standard MTU to avoid fragmentation.
-	maxChunkSize = 1200
+	// Account for obfuscation overhead (40 bytes) to stay under MTU.
+	maxPlainChunkSize = 1160 // 1200 - 40 (nonce + tag) = 1160 bytes of plaintext per packet
 
 	// sampleDuration is the fake Opus frame duration (20ms is standard).
 	sampleDuration = 20 * time.Millisecond
@@ -40,11 +42,15 @@ const (
 // RTP payloads (for reading) as an io.ReadWriteCloser for yamux.
 type Conn struct {
 	localTrack *webrtc.TrackLocalStaticSample
-	readCh     chan []byte // incoming RTP payloads
+	readCh     chan []byte // incoming RTP payloads (decrypted)
 	buf        []byte      // partial read buffer
 	closed     atomic.Bool
 	once       sync.Once
 	done       chan struct{}
+
+	// Obfuscation layer — encrypts payloads so the SFU can't inspect them.
+	// If nil, payloads pass through unencrypted (backwards compatible).
+	obfuscator *dcconn.Obfuscator
 
 	// Write serialization
 	writeMu sync.Mutex
@@ -55,27 +61,51 @@ type Conn struct {
 
 // New creates a Conn. The localTrack is used for sending data;
 // incoming data is fed via HandleRTP from the OnTrack callback.
-// The second argument is reserved for future encryption; pass nil.
-func New(localTrack *webrtc.TrackLocalStaticSample, _ interface{}) *Conn {
-	return &Conn{
+// obfuscator encrypts payloads before they enter the RTP track;
+// pass nil for no encryption (backwards compatible but DPI-visible).
+func New(localTrack *webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
+	c := &Conn{
 		localTrack: localTrack,
 		readCh:     make(chan []byte, readChSize),
 		done:       make(chan struct{}),
+		obfuscator: obfuscator,
 	}
+	if obfuscator != nil && obfuscator.Enabled() {
+		rtpLog.Info("RTP obfuscation enabled (XChaCha20-Poly1305, overhead: %d bytes/pkt)", obfuscator.Overhead())
+	}
+	return c
 }
 
 // HandleRTP should be called from the OnTrack ReadRTP loop.
-// It delivers the raw RTP payload bytes for Read().
+// It decrypts the raw RTP payload bytes and delivers them for Read().
 func (c *Conn) HandleRTP(payload []byte) {
 	if c.closed.Load() || len(payload) == 0 {
 		return
 	}
 
-	// Copy to avoid referencing the WebRTC buffer after return.
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
+	// Skip Opus silence frames (real keepalive, not data)
+	if isOpusSilence(payload) {
+		return
+	}
 
-	c.bytesRecv.Add(int64(len(payload)))
+	// Decrypt if obfuscation is enabled
+	plaintext := payload
+	if c.obfuscator != nil && c.obfuscator.Enabled() {
+		decrypted, err := c.obfuscator.Decrypt(payload)
+		if err != nil {
+			// Could be a genuine Opus frame from another participant or
+			// a backwards-compatible unencrypted packet — pass through
+			plaintext = payload
+		} else {
+			plaintext = decrypted
+		}
+	}
+
+	// Copy to avoid referencing the WebRTC buffer after return.
+	buf := make([]byte, len(plaintext))
+	copy(buf, plaintext)
+
+	c.bytesRecv.Add(int64(len(plaintext)))
 
 	// Deliver — block if full to avoid data loss (yamux needs reliability)
 	select {
@@ -108,9 +138,10 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 }
 
-// Write implements io.Writer. Writes raw bytes as Opus audio samples.
-// Large writes are split into MTU-safe chunks. No framing header is
-// added — yamux provides its own length-prefixed framing layer.
+// Write implements io.Writer. Encrypts data (if obfuscation is enabled)
+// and writes as Opus audio samples. Large writes are split into MTU-safe
+// chunks. No framing header is added — yamux provides its own
+// length-prefixed framing layer.
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
@@ -125,16 +156,32 @@ func (c *Conn) Write(p []byte) (int, error) {
 	totalLen := len(p)
 	remaining := p
 
+	// Choose chunk size based on whether obfuscation is active
+	chunkSize := 1200 // default: raw mode, full MTU
+	if c.obfuscator != nil && c.obfuscator.Enabled() {
+		chunkSize = maxPlainChunkSize // leave room for nonce + auth tag
+	}
+
 	for len(remaining) > 0 {
 		chunk := remaining
-		if len(chunk) > maxChunkSize {
-			chunk = remaining[:maxChunkSize]
+		if len(chunk) > chunkSize {
+			chunk = remaining[:chunkSize]
 		}
 		remaining = remaining[len(chunk):]
 
+		// Encrypt if obfuscation is enabled
+		data := chunk
+		if c.obfuscator != nil && c.obfuscator.Enabled() {
+			encrypted, err := c.obfuscator.Encrypt(chunk)
+			if err != nil {
+				return 0, fmt.Errorf("encrypt: %w", err)
+			}
+			data = encrypted
+		}
+
 		// Write as Opus sample — DPI sees a normal audio frame
 		if err := c.localTrack.WriteSample(media.Sample{
-			Data:     chunk,
+			Data:     data,
 			Duration: sampleDuration,
 		}); err != nil {
 			return 0, fmt.Errorf("write sample: %w", err)
@@ -185,4 +232,17 @@ func (c *Conn) Close() error {
 // Stats returns bytes sent/received.
 func (c *Conn) Stats() (sent, recv int64) {
 	return c.bytesSent.Load(), c.bytesRecv.Load()
+}
+
+// isOpusSilence detects standard Opus comfort noise / silence frames
+// so we don't try to decrypt keepalive packets.
+func isOpusSilence(payload []byte) bool {
+	if len(payload) < 1 || len(payload) > 3 {
+		return false
+	}
+	// Standard Opus silence: 0xF8 0xFF 0xFE (3 bytes)
+	if len(payload) == 3 && payload[0] == 0xF8 && payload[1] == 0xFF && payload[2] == 0xFE {
+		return true
+	}
+	return false
 }

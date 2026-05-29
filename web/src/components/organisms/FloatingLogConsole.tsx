@@ -1,37 +1,73 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Button, Card, Typography, Tag, Space, Badge } from 'antd';
 import { CodeOutlined, CloseOutlined, ExpandAltOutlined, ShrinkOutlined } from '@ant-design/icons';
-import { api } from '../../api';
+import { createLogStream } from '../../api';
 
 const { Text } = Typography;
+
+interface LogEntry {
+  timestamp: string;
+  level: string;
+  component: string;
+  message: string;
+}
 
 export function FloatingLogConsole() {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const [logs, setLogs] = useState<any[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [connected, setConnected] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
-  const fetchLogs = async () => {
-    if (!open) return;
-    try {
-      const res = await api.getLogs(500);
-      if (res && res.logs) {
-        setLogs(res.logs);
-      }
-    } catch (e) {
-      console.error('Failed to fetch logs:', e);
-    }
-  };
-
+  // WebSocket connection management
   useEffect(() => {
-    let interval: any;
-    if (open) {
-      fetchLogs();
-      interval = setInterval(fetchLogs, 1500);
+    if (!open) {
+      // Close WebSocket when console is closed
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      return;
     }
-    return () => clearInterval(interval);
+
+    const connect = () => {
+      const ws = createLogStream();
+
+      ws.onopen = () => setConnected(true);
+
+      ws.onmessage = (e) => {
+        try {
+          const entry: LogEntry = JSON.parse(e.data);
+          setLogs(prev => {
+            const next = [...prev, entry];
+            return next.length > 500 ? next.slice(-400) : next;
+          });
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        // Auto-reconnect after 3s if still open
+        setTimeout(() => {
+          if (open) connect();
+        }, 3000);
+      };
+
+      ws.onerror = () => ws.close();
+      wsRef.current = ws;
+    };
+
+    connect();
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
   }, [open]);
 
   useEffect(() => {
@@ -104,9 +140,12 @@ export function FloatingLogConsole() {
         <Space>
           <CodeOutlined style={{ color: '#52c41a' }} />
           <span className="text-gray-200 font-mono font-bold">System Terminal</span>
-          {autoScroll ? (
+          {connected ? (
             <Badge status="processing" text={<span className="text-xs text-gray-400">Live</span>} />
           ) : (
+            <Badge status="error" text={<span className="text-xs text-gray-500">Offline</span>} />
+          )}
+          {!autoScroll && (
             <span className="text-xs text-gray-500 ml-2">(Auto-scroll paused)</span>
           )}
         </Space>
@@ -136,7 +175,7 @@ export function FloatingLogConsole() {
       >
         {logs.map((log, i) => (
           <div key={i} className="mb-1 flex items-start break-words hover:bg-gray-800 px-1 py-0.5 rounded">
-            <span className="text-gray-500 mr-2 shrink-0">{log.timestamp.split(' ')[1]}</span>
+            <span className="text-gray-500 mr-2 shrink-0">{(log.timestamp.split(' ')[1]) || log.timestamp}</span>
             <span style={{ color: getLevelColor(log.level), width: '45px' }} className="shrink-0 font-bold">
               {log.level}
             </span>
@@ -163,7 +202,8 @@ export function FloatingLogConsole() {
         .custom-scrollbar::-webkit-scrollbar-thumb:hover {
           background: #555;
         }
-      `}</style>
+      `}
+      </style>
     </Card>
   );
 }

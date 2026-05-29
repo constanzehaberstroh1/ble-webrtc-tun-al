@@ -34,10 +34,6 @@ type Server struct {
 	cfg       *config.Config
 	transport *transport.WebRTCTransport
 	mux       *http.ServeMux
-	logs      []LogEntry
-	logMu     sync.RWMutex
-	logSubs   map[chan LogEntry]struct{}
-	subMu     sync.RWMutex
 	upgrader  websocket.Upgrader
 
 	// Signaling: pending SDP offer from client
@@ -78,7 +74,6 @@ func NewServer(cfg *config.Config, t *transport.WebRTCTransport) *Server {
 		cfg:         cfg,
 		transport:   t,
 		mux:         http.NewServeMux(),
-		logSubs:     make(map[chan LogEntry]struct{}),
 		sdpOfferCh:  make(chan string, 1),
 		sdpAnswerCh: make(chan string, 1),
 		startTime:   time.Now(),
@@ -107,29 +102,20 @@ func (s *Server) Start(ctx context.Context) error {
 	return srv.ListenAndServe()
 }
 
-// AddLog adds a log entry and notifies subscribers.
+// AddLog adds a log entry via the centralized async logger.
+// This is a compatibility wrapper — the centralized logger handles
+// ring-buffer storage and WebSocket fan-out automatically.
 func (s *Server) AddLog(level, message string) {
-	entry := LogEntry{
-		Time:    time.Now().Format("15:04:05"),
-		Level:   level,
-		Message: message,
+	switch strings.ToLower(level) {
+	case "error":
+		adminLog.Error("%s", message)
+	case "warn", "warning":
+		adminLog.Warn("%s", message)
+	case "debug":
+		adminLog.Debug("%s", message)
+	default:
+		adminLog.Info("%s", message)
 	}
-
-	s.logMu.Lock()
-	s.logs = append(s.logs, entry)
-	if len(s.logs) > 1000 {
-		s.logs = s.logs[len(s.logs)-500:]
-	}
-	s.logMu.Unlock()
-
-	s.subMu.RLock()
-	for ch := range s.logSubs {
-		select {
-		case ch <- entry:
-		default:
-		}
-	}
-	s.subMu.RUnlock()
 }
 
 // GetSDPOffer returns the channel for receiving SDP offers from clients.
@@ -201,7 +187,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"tunnel":       tStatus,
 		"server_role":  s.cfg.Role,
 		"bale_mode":    s.cfg.BaleAccessToken != "",
-		"log_count":    len(s.logs),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -214,13 +199,28 @@ func (s *Server) SetTunnelStatus(fn func(*TunnelStatus)) {
 	s.statusMu.Unlock()
 }
 
+// handleLogs serves recent logs from the centralized ring buffer.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	s.logMu.RLock()
-	defer s.logMu.RUnlock()
+	logs := logger.GetLogs(500)
+	// Convert to legacy format for the admin template
+	type legacyEntry struct {
+		Time    string `json:"time"`
+		Level   string `json:"level"`
+		Message string `json:"message"`
+	}
+	result := make([]legacyEntry, len(logs))
+	for i, l := range logs {
+		result[i] = legacyEntry{
+			Time:    l.Timestamp,
+			Level:   strings.ToLower(l.Level),
+			Message: fmt.Sprintf("[%s] %s", l.Component, l.Message),
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.logs)
+	json.NewEncoder(w).Encode(result)
 }
 
+// handleLogsWS streams logs via WebSocket using the centralized subscriber.
 func (s *Server) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -228,18 +228,37 @@ func (s *Server) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	ch := make(chan LogEntry, 50)
-	s.subMu.Lock()
-	s.logSubs[ch] = struct{}{}
-	s.subMu.Unlock()
-	defer func() {
-		s.subMu.Lock()
-		delete(s.logSubs, ch)
-		s.subMu.Unlock()
+	// Subscribe to centralized log stream
+	sub := logger.Subscribe(logger.DEBUG, "")
+	defer logger.Unsubscribe(sub)
+
+	// Read pump — detect disconnection
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
 	}()
 
-	for entry := range ch {
-		if err := conn.WriteJSON(entry); err != nil {
+	// Write pump — stream entries in legacy format
+	for {
+		select {
+		case entry, ok := <-sub.Ch:
+			if !ok {
+				return
+			}
+			legacy := LogEntry{
+				Time:    entry.Timestamp,
+				Level:   strings.ToLower(entry.Level),
+				Message: fmt.Sprintf("[%s] %s", entry.Component, entry.Message),
+			}
+			if err := conn.WriteJSON(legacy); err != nil {
+				return
+			}
+		case <-done:
 			return
 		}
 	}

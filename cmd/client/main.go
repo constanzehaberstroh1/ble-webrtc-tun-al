@@ -1025,7 +1025,7 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 }
 
 // initChannel establishes one Bale call → SFU → yamux channel.
-func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPair, label string) (*channelState, *yamux.Session) {
+func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPair, label string, obfuscator *dcconn.Obfuscator) (*channelState, *yamux.Session) {
 	// Create a copy of config for this channel
 	chanCfg := *baseCfg
 	chanCfg.BaleAccessToken = tp.ClientToken
@@ -1070,7 +1070,7 @@ func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPai
 
 	// Connect to LiveKit SFU
 	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, nil) // Legacy initChannel — no obfuscator
+	sfu := lk.NewSFUTransport(&chanCfg, obfuscator) // Legacy initChannel — obfuscator for anti-DPI
 	if err := sfu.Connect(ctx); err != nil {
 		mainLog.Info("[%s] SFU connect: %v", label, err)
 		client.Close()
@@ -1497,7 +1497,7 @@ func detectRemoteServerURL() string {
 	}
 
 	// 3. Hardcoded fallback for known Clever Cloud deployment
-	const fallbackURL = "https://app-8a8f8bce-3219-4fbb-ac19-a6b6783eff5b.cleverapps.io"
+	const fallbackURL = "https://app-7c1a120b-18c6-43fd-850c-b2883b209c3d.cleverapps.io"
 	return fallbackURL
 }
 
