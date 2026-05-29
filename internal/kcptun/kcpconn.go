@@ -1,6 +1,8 @@
 package kcptun
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
@@ -23,17 +25,38 @@ type Conn struct {
 	closed     atomic.Bool
 }
 
+// DeriveConvID derives a KCP conversation ID from a shared secret.
+// Both client and server must use the same secret to get the same ID.
+// If secret is empty, falls back to a default (less secure but compatible).
+func DeriveConvID(secret string) uint32 {
+	if secret == "" {
+		return 0x11223344 // backwards compatible default
+	}
+	// Use SHA-256 of "kcp-conv:" + secret, take first 4 bytes as uint32
+	h := sha256.Sum256([]byte("kcp-conv:" + secret))
+	return binary.BigEndian.Uint32(h[:4])
+}
+
 // Wrap returns a new KCP-wrapped connection.
 // underlying is typically the rtpconn.Conn representing the lossy audio track.
+// Uses the default conversation ID. For secret-derived IDs, use WrapWithSecret.
 func Wrap(underlying io.ReadWriteCloser) *Conn {
+	return WrapWithSecret(underlying, "")
+}
+
+// WrapWithSecret returns a new KCP-wrapped connection with a conversation ID
+// derived from the shared obfuscation secret. This prevents the KCP conv ID
+// from being a recognizable fingerprint.
+func WrapWithSecret(underlying io.ReadWriteCloser, secret string) *Conn {
+	convID := DeriveConvID(secret)
+
 	c := &Conn{
 		underlying: underlying,
 		readCh:     make(chan []byte, 4096),
 		done:       make(chan struct{}),
 	}
 
-	// Static conversation ID for pairing endpoints
-	c.kcp = kcp.NewKCP(0x11223344, func(buf []byte, size int) {
+	c.kcp = kcp.NewKCP(convID, func(buf []byte, size int) {
 		// Output callback: write KCP frames to the underlying lossy transport
 		if !c.closed.Load() {
 			c.underlying.Write(buf[:size])

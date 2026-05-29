@@ -11,6 +11,7 @@ import (
 
 	"github.com/pion/webrtc/v3"
 	"github.com/salman/ble-webrtc-tun/internal/config"
+	"github.com/salman/ble-webrtc-tun/internal/dcconn"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/rtpconn"
 )
@@ -77,6 +78,9 @@ type WebRTCTransport struct {
 	connected  bool
 	stats      Stats
 	done       chan struct{}
+
+	// Obfuscation layer (anti-DPI)
+	obfuscator *dcconn.Obfuscator
 }
 
 // NewWebRTCTransport creates a new WebRTC transport.
@@ -86,6 +90,14 @@ func NewWebRTCTransport(cfg *config.Config) *WebRTCTransport {
 		done:  make(chan struct{}),
 		stats: Stats{StartTime: time.Now()},
 	}
+}
+
+// SetObfuscator sets the obfuscator for payload encryption.
+// Must be called before Initialize/setupAudioTrack.
+func (t *WebRTCTransport) SetObfuscator(obf *dcconn.Obfuscator) {
+	t.mu.Lock()
+	t.obfuscator = obf
+	t.mu.Unlock()
 }
 
 // SetOnData sets the callback for received data.
@@ -268,7 +280,7 @@ func (t *WebRTCTransport) setupAudioTrack() error {
 
 	t.mu.Lock()
 	t.audioTrack = audioTrack
-	t.rtpConn = rtpconn.New(audioTrack, nil)
+	t.rtpConn = rtpconn.New(audioTrack, t.obfuscator)
 	t.mu.Unlock()
 
 	// Start silence loop to keep the voice call "alive"

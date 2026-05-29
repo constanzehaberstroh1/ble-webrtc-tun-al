@@ -181,11 +181,15 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	// 10. Setup data transport — prefer RTP audio tunnel for DPI evasion
 	// Create rtpconn adapter: yamux data flows through Opus RTP packets
 	s.mu.Lock()
-	s.rtpDataConn = rtpconn.New(s.track, nil) // no extra encryption needed — Opus payload is opaque
+	s.rtpDataConn = rtpconn.New(s.track, s.obfuscator) // encrypt payloads before they enter the Opus track
 	s.useRTP = true
 	s.connected = true
 	s.mu.Unlock()
-	sfuLog.Info("✅ Opus RTP tunnel mode initialized (DPI evasion active)")
+	if s.obfuscator != nil && s.obfuscator.Enabled() {
+		sfuLog.Info("✅ Opus RTP tunnel mode initialized (DPI evasion + XChaCha20 encryption active)")
+	} else {
+		sfuLog.Warn("⚠️ Opus RTP tunnel mode initialized (DPI evasion active, NO payload encryption — set OBFUSCATION_SECRET!)")
+	}
 
 	// Also setup DataChannel if it opens (for control messages, not data)
 	go func() {
@@ -439,14 +443,21 @@ func (s *SFUTransport) handleSubscriberOffer(offer *lkproto.SessionDescription) 
 }
 
 // DataConn returns the io.ReadWriteCloser for yamux.
-// In RTP mode, returns the rtpconn; in DC mode, returns the dcconn.
+// In RTP mode, returns the rtpconn wrapped in KCP (with secret-derived conv ID);
+// in DC mode, returns the dcconn.
 func (s *SFUTransport) DataConn() io.ReadWriteCloser {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.useRTP && s.rtpDataConn != nil {
 		if s.kcpConn == nil {
-			sfuLog.Info("Wrapping RTP connection with KCP reliability layer")
-			s.kcpConn = kcptun.Wrap(s.rtpDataConn)
+			// Derive KCP conversation ID from the obfuscation secret
+			// so the conv ID itself isn't a recognizable fingerprint.
+			secret := ""
+			if s.cfg != nil {
+				secret = s.cfg.ObfuscationSecret
+			}
+			sfuLog.Info("Wrapping RTP connection with KCP reliability layer (conv_id derived from secret)")
+			s.kcpConn = kcptun.WrapWithSecret(s.rtpDataConn, secret)
 		}
 		return s.kcpConn
 	}

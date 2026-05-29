@@ -195,13 +195,10 @@ func (d *Database) AutoPairUnmatched(ownerID string) (int, error) {
 func (d *Database) GetAvailableServerAccounts(ownerID string) ([]Account, error) {
 	var accounts []Account
 
-	// Server accounts paired by OTHER owners
-	pairedByOthers := d.DB.Model(&Pairing{}).
-		Where("active = ? AND owner_id != ?", true, ownerID).
-		Select("server_account_id")
 
-	if err := d.DB.Where("role = ? AND enabled = ? AND id NOT IN (?)",
-		RoleServer, true, pairedByOthers,
+
+	if err := d.DB.Where("role = ? AND enabled = ?",
+		RoleServer, true,
 	).Order("created_at ASC").Find(&accounts).Error; err != nil {
 		return nil, err
 	}

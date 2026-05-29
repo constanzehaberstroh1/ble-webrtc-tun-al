@@ -88,7 +88,6 @@ export const api = {
   forceEndAllCalls: () => request('/connections/end-all', { method: 'POST' }),
 
   getEvents: (since?: number) => request(`/events?since=${since || 0}`),
-  getLogs: (limit?: number) => request(`/logs?limit=${limit || 1000}`),
   getGuide: () => request('/guide'),
 
   // Sync API
@@ -116,5 +115,34 @@ export const api = {
   // Backup & Restore
   dbBackup: () => request('/db/backup'),
   dbRestore: (data: any) => request('/db/restore', { method: 'POST', body: JSON.stringify(data) }),
+
+  // Logs
+  getLogs: (limit?: number, level?: string, component?: string) => {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (level) params.set('level', level);
+    if (component) params.set('component', component);
+    return request(`/logs?${params.toString()}`);
+  },
+  getLogFiles: () => request('/logs/files'),
+  getLogDownloadURL: (file: string): string => {
+    return `/api/logs/download?file=${encodeURIComponent(file)}`;
+  },
 };
+
+// createLogStream creates a WebSocket connection for live log streaming.
+// Returns the WebSocket instance. The caller is responsible for closing it.
+export function createLogStream(opts?: { level?: string; component?: string }): WebSocket {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const params = new URLSearchParams();
+  if (opts?.level) params.set('level', opts.level);
+  if (opts?.component) params.set('component', opts.component);
+
+  // Encode auth into query for WebSocket (same pattern as terminal)
+  const auth = sessionStorage.getItem('auth') || '';
+  if (auth) params.set('auth', auth);
+
+  const url = `${proto}//${window.location.host}/api/logs/ws?${params.toString()}`;
+  return new WebSocket(url);
+}
 
