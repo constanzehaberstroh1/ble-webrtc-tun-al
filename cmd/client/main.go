@@ -830,6 +830,11 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 
 // monitorAndReconnect watches a QUIC connection and auto-reconnects on failure.
+//
+// Three detection paths (all trigger immediate reconnect):
+//  1. QUIC context cancelled (connection closed by QUIC layer or circuit breaker)
+//  2. WebRTC ICE layer disconnected/failed (binds WebRTC to QUIC lifecycle)
+//  3. Pool circuit breaker forced the connection closed (fail count ≥ kill threshold)
 func (tm *TunnelManager) monitorAndReconnect(
 	ctx context.Context,
 	tunnelPool *pool.TunnelPool,
@@ -849,24 +854,42 @@ func (tm *TunnelManager) monitorAndReconnect(
 	currentCh := ch
 
 	for {
-		// REGULATION ENGINE: 5s liveness check via QUIC connection context
+		// ── Liveness check every 3s ───────────────────────────────────────
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
-			if currentQConn != nil {
-				select {
-				case <-currentQConn.Context().Done():
-					mainLog.Warn("[%s] QUIC connection dead", label)
-				default:
-					continue // still alive
-				}
+		case <-time.After(3 * time.Second):
+		}
+
+		dead := false
+
+		// Check 1: QUIC connection context (catches circuit-breaker kills too)
+		if currentQConn != nil {
+			select {
+			case <-currentQConn.Context().Done():
+				mainLog.Warn("[%s] QUIC connection dead (context cancelled)", label)
+				dead = true
+			default:
 			}
 		}
 
-		// Connection dead — clean up
-		mainLog.Warn("[%s] 💀 QUIC connection dead — reconnecting (backoff: %.0fs)", label, backoff.Seconds())
-		tm.setChannelPhase(idx, PhaseDisconnected, "quic connection died, reconnecting...")
+		// Check 2: WebRTC ICE state — if ICE dies, kill QUIC immediately
+		// rather than waiting for QUIC's 30-60s idle timeout.
+		if !dead && currentCh != nil && currentCh.sfu != nil {
+			health := currentCh.sfu.GetHealth()
+			if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
+				mainLog.Warn("[%s] ⚠️ WebRTC ICE is %s — force-killing QUIC", label, health.PubICEState)
+				dead = true
+			}
+		}
+
+		if !dead {
+			continue // still alive
+		}
+
+		// ── Reconnect flow ────────────────────────────────────────────────
+		mainLog.Warn("[%s] 💀 Channel dead — reconnecting (backoff: %.0fs)", label, backoff.Seconds())
+		tm.setChannelPhase(idx, PhaseDisconnected, "channel dead, reconnecting...")
 
 		if currentQConn != nil {
 			tunnelPool.Remove(currentQConn)
@@ -894,7 +917,6 @@ func (tm *TunnelManager) monitorAndReconnect(
 		case <-time.After(backoff):
 		}
 
-		// Reconnect
 		tm.setChannelPhase(idx, PhaseBaleConnect, "")
 		newCh, newQConn := tm.initChannelTracked(ctx, idx, tp, label)
 		if newCh == nil || newQConn == nil {
@@ -910,7 +932,7 @@ func (tm *TunnelManager) monitorAndReconnect(
 		mu.Unlock()
 		mainLog.Info("[%s] ✅ Reconnected!", label)
 
-		backoff = 5 * time.Second
+		backoff = 3 * time.Second
 		currentQConn = newQConn
 		currentCh = newCh
 
@@ -926,6 +948,7 @@ func (tm *TunnelManager) monitorAndReconnect(
 		}
 	}
 }
+
 
 func min(a, b time.Duration) time.Duration {
 	if a < b {

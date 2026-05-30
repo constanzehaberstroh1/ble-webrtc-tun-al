@@ -1,17 +1,18 @@
 // Package pool manages a set of QUIC connections (one per WebRTC channel)
-// and provides flow-pinned load balancing for proxy streams.
+// and provides flow-pinned load balancing with a Circuit Breaker.
 //
-// QUIC Regulation Engine:
-//   - Each channel = one quic.Connection over an OpusPacketConn
-//   - Load balancing: "least loaded" by active stream count (no latency heuristics)
-//   - Flow pinning: each proxy TCP connection is locked to one QUIC connection
-//   - No HoL blocking: a dropped RTP packet pauses only the affected QUIC stream,
-//     not the entire tunnel
+// Circuit Breaker logic:
+//   - Channels with ≥3 consecutive stream failures are skipped entirely.
+//   - After 5 failures the connection is force-closed so monitorAndReconnect
+//     tears it down and re-dials a fresh WebRTC+QUIC channel.
+//   - Success resets the failure counter.
+//   - Stream timeout is 2s (was 5s) so black-hole connections fail fast.
 package pool
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -23,21 +24,34 @@ import (
 
 var poolLog = logger.New("pool")
 
+// circuitBreakerThreshold is the number of consecutive stream open failures
+// after which a channel is excluded from load balancing.
+const circuitBreakerThreshold = int32(3)
+
+// circuitBreakerKill is the number of consecutive failures that triggers a
+// force-close of the QUIC connection, causing monitorAndReconnect to re-dial.
+const circuitBreakerKill = int32(5)
+
+// streamTimeout is how long OpenStreamSync waits before giving up.
+// 2s is intentionally short: failing fast lets the caller retry on a
+// healthy channel instead of blocking the proxy for 5-10 seconds.
+const streamTimeout = 2 * time.Second
+
 // TunnelPool manages multiple QUIC connections and distributes proxy streams
-// using a "least active streams" load balancer.
+// using a least-active-streams load balancer with circuit-breaker protection.
 type TunnelPool struct {
-	mu       sync.RWMutex
-	entries  []*PoolEntry
-	done     chan struct{}
-	once     sync.Once
+	mu      sync.RWMutex
+	entries []*PoolEntry
+	done    chan struct{}
+	once    sync.Once
 }
 
-// PoolEntry wraps one QUIC connection with stream-count tracking.
+// PoolEntry wraps one QUIC connection with stream-count and failure tracking.
 type PoolEntry struct {
 	Conn         quic.Connection
 	Label        string
 	ActiveStreams atomic.Int32 // streams currently open on this connection
-	FailCount    atomic.Int32
+	FailCount    atomic.Int32 // consecutive stream open failures (circuit breaker)
 	addedAt      time.Time
 }
 
@@ -73,13 +87,14 @@ func (p *TunnelPool) Remove(conn quic.Connection) {
 	}
 }
 
-// OpenStream opens a QUIC stream on the least-loaded connection.
+// OpenStream opens a QUIC stream on the least-loaded HEALTHY connection.
 //
-// "Least loaded" = fewest active streams. This ensures new TCP connections
-// spread evenly across channels. Flow pinning guarantees each proxy request
-// stays on one QUIC connection so QUIC's per-stream ordering works correctly.
+// Circuit breaker: channels with ≥ circuitBreakerThreshold consecutive
+// failures are excluded. Their effective load is treated as MaxInt32 so
+// the balancer always prefers a fresh channel. After circuitBreakerKill
+// failures the connection is force-closed to trigger re-dial.
 //
-// Returns a trackedStream that decrements ActiveStreams on Close().
+// Returns a trackedStream that auto-decrements ActiveStreams on Close().
 func (p *TunnelPool) OpenStream() (net.Conn, error) {
 	p.mu.RLock()
 	entries := make([]*PoolEntry, len(p.entries))
@@ -90,41 +105,74 @@ func (p *TunnelPool) OpenStream() (net.Conn, error) {
 		return nil, fmt.Errorf("no active tunnels")
 	}
 
-	// Find healthy entries and pick the one with fewest active streams
+	// ── Circuit-Breaker Selection ──────────────────────────────────────────
+	// Score each entry: activeStreams + huge penalty per failure.
+	// Entries with ≥ threshold failures are skipped entirely.
 	var best *PoolEntry
+	bestScore := int32(math.MaxInt32)
+
 	for _, e := range entries {
 		if e.Conn == nil {
 			continue
 		}
-		// Check if connection is still alive
+		// Skip connections that are internally dead
 		select {
 		case <-e.Conn.Context().Done():
-			continue // connection closed
+			continue
 		default:
 		}
-		if best == nil || e.ActiveStreams.Load() < best.ActiveStreams.Load() {
+
+		fails := e.FailCount.Load()
+		if fails >= circuitBreakerThreshold {
+			// Channel is in circuit-breaker state — skip it
+			poolLog.Warn("[CB] Skipping %s (fails=%d, circuit open)", e.Label, fails)
+			continue
+		}
+
+		// Score: active streams + 100 penalty per failure (so 2 failures = heavy penalty)
+		score := e.ActiveStreams.Load() + fails*100
+		if best == nil || score < bestScore {
+			bestScore = score
 			best = e
 		}
 	}
 
 	if best == nil {
+		// All channels are either dead or circuit-broken.
+		// Count how many are just circuit-broken (not fully dead) — they may recover.
+		broken := 0
+		for _, e := range entries {
+			if e.FailCount.Load() >= circuitBreakerThreshold {
+				broken++
+			}
+		}
+		if broken > 0 {
+			return nil, fmt.Errorf("all %d tunnels in circuit-breaker lockdown (broken=%d)", len(entries), broken)
+		}
 		return nil, fmt.Errorf("all %d tunnels are closed", len(entries))
 	}
 
-	// Open stream with a short timeout to avoid hanging on a dead connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// ── Open Stream with Fast Timeout ─────────────────────────────────────
+	ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
 	defer cancel()
 
 	stream, err := best.Conn.OpenStreamSync(ctx)
 	if err != nil {
-		best.FailCount.Add(1)
-		poolLog.Warn("Stream open failed on %s (fails=%d): %v",
-			best.Label, best.FailCount.Load(), err)
+		newFails := best.FailCount.Add(1)
+		poolLog.Warn("[CB] Stream open failed on %s (fails=%d): %v", best.Label, newFails, err)
+
+		// Kill the connection if it keeps failing — forces monitorAndReconnect
+		if newFails >= circuitBreakerKill {
+			poolLog.Warn("[CB] Circuit breaker KILL: force-closing %s after %d failures", best.Label, newFails)
+			best.Conn.CloseWithError(1, "circuit breaker: stream exhaustion")
+		}
+
 		return nil, fmt.Errorf("open stream on %s: %w", best.Label, err)
 	}
 
-	if best.FailCount.Load() > 0 {
-		best.FailCount.Store(0)
+	// ── Success — reset circuit breaker ───────────────────────────────────
+	if old := best.FailCount.Swap(0); old > 0 {
+		poolLog.Info("[CB] %s recovered (was fails=%d)", best.Label, old)
 	}
 	best.ActiveStreams.Add(1)
 	poolLog.Info("Opened stream on %s (active: %d)", best.Label, best.ActiveStreams.Load())
@@ -166,33 +214,44 @@ func (p *TunnelPool) CloseAll() {
 	poolLog.Info("All QUIC connections closed")
 }
 
-// healthMonitorLoop logs pool status every 3 seconds.
+// healthMonitorLoop logs pool status and evicts zombie entries every 5s.
 func (p *TunnelPool) healthMonitorLoop() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			p.mu.RLock()
+			p.mu.Lock()
+			live := p.entries[:0]
 			for _, e := range p.entries {
 				select {
 				case <-e.Conn.Context().Done():
-					poolLog.Warn("[%s] QUIC connection dead (active streams: %d)", e.Label, e.ActiveStreams.Load())
+					// Dead AND no active streams — safe to evict from pool
+					if e.ActiveStreams.Load() <= 0 {
+						poolLog.Warn("[Health] Evicting dead entry %s", e.Label)
+						continue // don't keep it
+					}
 				default:
-					poolLog.Info("[%s] QUIC alive (active streams: %d)", e.Label, e.ActiveStreams.Load())
 				}
+				fails := e.FailCount.Load()
+				streams := e.ActiveStreams.Load()
+				if fails >= circuitBreakerThreshold {
+					poolLog.Warn("[Health] %s: CIRCUIT OPEN (fails=%d, streams=%d)", e.Label, fails, streams)
+				} else {
+					poolLog.Info("[Health] %s: alive (fails=%d, streams=%d)", e.Label, fails, streams)
+				}
+				live = append(live, e)
 			}
-			p.mu.RUnlock()
+			p.entries = live
+			p.mu.Unlock()
 		}
 	}
 }
 
 // ─── trackedStream ────────────────────────────────────────────────────────────
 
-// trackedStream wraps a net.Conn and decrements the parent entry's
-// ActiveStreams counter exactly once on Close().
 type trackedStream struct {
 	net.Conn
 	entry *PoolEntry
@@ -211,7 +270,6 @@ func (s *trackedStream) Close() error {
 
 // ─── quicStreamConn ───────────────────────────────────────────────────────────
 
-// quicStreamConn adds LocalAddr/RemoteAddr to quic.Stream so it satisfies net.Conn.
 type quicStreamConn struct {
 	quic.Stream
 	local  net.Addr
@@ -229,10 +287,8 @@ func wrapQUICStream(s quic.Stream, conn quic.Connection) net.Conn {
 func (c *quicStreamConn) LocalAddr() net.Addr  { return c.local }
 func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
 
-// ─── Compatibility shim (legacy yamux callers) ────────────────────────────────
-// These stubs allow old code that hasn't been migrated yet to compile.
+// ─── Compatibility shims ──────────────────────────────────────────────────────
 
-// Sessions returns nil (QUIC pool has no yamux sessions).
 func (p *TunnelPool) Sessions() []*PoolEntry {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -241,5 +297,10 @@ func (p *TunnelPool) Sessions() []*PoolEntry {
 	return out
 }
 
-// LatencyMs returns a placeholder (QUIC pool does not measure latency separately).
+// LatencyMs returns a placeholder (QUIC pool measures stream counts, not RTT).
 func (e *PoolEntry) LatencyMs() int64 { return 0 }
+
+// next is used by legacy callers; no-op in QUIC pool.
+var _next uint32
+
+func init() { atomic.StoreUint32(&_next, 0) }
