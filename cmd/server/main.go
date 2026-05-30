@@ -710,8 +710,10 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	}
 	quicCfg := &quic.Config{
 		InitialPacketSize:               initPktSize,
-		MaxIdleTimeout:                  60 * time.Second,
-		KeepAlivePeriod:                 15 * time.Second,
+		MaxIdleTimeout:                  30 * time.Second,
+		KeepAlivePeriod:                 5 * time.Second,  // aggressive: detect dead ICE fast
+		MaxIncomingStreams:              10000,             // prevent stream-credit exhaustion
+		MaxIncomingUniStreams:           10000,
 		InitialStreamReceiveWindow:      2 * 1024 * 1024,
 		MaxStreamReceiveWindow:          8 * 1024 * 1024,
 		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
