@@ -273,6 +273,48 @@ func (c *Conn) Stats() (sent, recv int64) {
 	return c.bytesSent.Load(), c.bytesRecv.Load()
 }
 
+// WriteFrame writes exactly ONE frame to the pacer queue without splitting.
+// Used by quicconn.OpusPacketConn — QUIC already enforces MTU so the datagram
+// is guaranteed to be ≤1100 bytes; no chunking is needed.
+func (c *Conn) WriteFrame(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, fmt.Errorf("connection closed")
+	}
+	if c.localTrack == nil {
+		return 0, fmt.Errorf("no local track")
+	}
+	data := p
+	if c.obfuscator != nil && c.obfuscator.Enabled() {
+		encrypted, err := c.obfuscator.Encrypt(p)
+		if err != nil {
+			return 0, fmt.Errorf("encrypt: %w", err)
+		}
+		data = encrypted
+	}
+	select {
+	case c.outboundQueue <- data:
+	case <-c.done:
+		return 0, fmt.Errorf("connection closed")
+	}
+	c.bytesSent.Add(int64(len(p)))
+	return len(p), nil
+}
+
+// ReadPacket reads one complete decrypted RTP payload (= one QUIC datagram).
+// Unlike Read(), this does NOT buffer partial reads — each call returns one
+// atomic frame. Used by quicconn.OpusPacketConn for QUIC's ReadFrom.
+func (c *Conn) ReadPacket() ([]byte, error) {
+	select {
+	case data, ok := <-c.readCh:
+		if !ok {
+			return nil, fmt.Errorf("connection closed")
+		}
+		return data, nil
+	case <-c.done:
+		return nil, fmt.Errorf("connection closed")
+	}
+}
+
 // QueueDepth returns the number of frames currently waiting in the pacer queue.
 // Useful for monitoring backpressure.
 func (c *Conn) QueueDepth() int {

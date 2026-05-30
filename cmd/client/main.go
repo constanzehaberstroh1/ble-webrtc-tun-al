@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/api"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
@@ -29,19 +29,21 @@ import (
 	lk "github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/pool"
+	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
 )
 
 var mainLog = logger.New("main")
 
-// channelState holds the resources for one Bale channel.
+// channelState holds resources for one Bale channel.
 type channelState struct {
 	index  int
 	label  string
 	client *bale.Client
 	sfu    *lk.SFUTransport
 	cfg    *config.Config
-	pair   config.TokenPair // pairing info for auto-reconnect
+	pair   config.TokenPair
+	qconn  quic.Connection // QUIC connection for this channel
 }
 
 func main() {
@@ -715,10 +717,9 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		tm.setChannelPhase(i, PhaseBaleConnect, "")
 		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (sequential)...", label, i+1, len(pairs))
 
-		ch, session := tm.initChannelTracked(ctx, i, pair, label)
-		if ch == nil || session == nil {
+		ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
+		if ch == nil || qconn == nil {
 			mainLog.Warn("[%s] ❌ Channel init failed — continuing to next pair", label)
-			// Brief cooldown after failure before trying next pair
 			select {
 			case <-ctx.Done():
 				return
@@ -728,7 +729,7 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		}
 
 		tm.setChannelPhase(i, PhaseTunnelActive, "")
-		tunnelPool.Add(session, label)
+		tunnelPool.Add(qconn, label)
 		mu.Lock()
 		channels = append(channels, ch)
 		mu.Unlock()
@@ -744,8 +745,7 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			}
 		})
 
-		// Monitor this channel for death and auto-reconnect
-		go tm.monitorAndReconnect(ctx, tunnelPool, ch, session, i, pair, label, &mu, &channels, &proxyOnce)
+		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
 	}
 
 	if ctx.Err() != nil {
@@ -819,14 +819,12 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 }
 
 
-// monitorAndReconnect watches a yamux session and auto-reconnects on failure.
-// Tries warm connections first for instant failover, then falls back to cold init.
-// Uses exponential backoff (5s → 10s → 20s → 40s → 60s cap).
+// monitorAndReconnect watches a QUIC connection and auto-reconnects on failure.
 func (tm *TunnelManager) monitorAndReconnect(
 	ctx context.Context,
 	tunnelPool *pool.TunnelPool,
 	ch *channelState,
-	session *yamux.Session,
+	qconn quic.Connection,
 	idx int,
 	tp config.TokenPair,
 	label string,
@@ -837,47 +835,40 @@ func (tm *TunnelManager) monitorAndReconnect(
 	backoff := 3 * time.Second
 	const maxBackoff = 30 * time.Second
 
-	currentSession := session
+	currentQConn := qconn
 	currentCh := ch
 
 	for {
-		// REGULATION ENGINE: 5s ping check (was 10s) — faster dead-session detection.
-		// Combined with pool's 2s health monitor, channels reconnect within ~5s of dying.
+		// REGULATION ENGINE: 5s liveness check via QUIC connection context
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(5 * time.Second):
-			// Check session health proactively using yamux Ping
-			// This detects dead connections faster than waiting for IsClosed()
-			if currentSession != nil && !currentSession.IsClosed() {
-				_, err := currentSession.Ping()
-				if err == nil {
-					continue // Session is alive
+			if currentQConn != nil {
+				select {
+				case <-currentQConn.Context().Done():
+					mainLog.Warn("[%s] QUIC connection dead", label)
+				default:
+					continue // still alive
 				}
-				mainLog.Warn("[%s] Yamux ping failed: %v — treating as dead", label, err)
 			}
 		}
 
-		// Session is dead — clean up
-		mainLog.Warn("[%s] 💀 Session dead — starting auto-reconnect (backoff: %.0fs)", label, backoff.Seconds())
-		tm.setChannelPhase(idx, PhaseDisconnected, "session died, reconnecting...")
+		// Connection dead — clean up
+		mainLog.Warn("[%s] 💀 QUIC connection dead — reconnecting (backoff: %.0fs)", label, backoff.Seconds())
+		tm.setChannelPhase(idx, PhaseDisconnected, "quic connection died, reconnecting...")
 
-		// Remove dead session from pool
-		if currentSession != nil {
-			tunnelPool.Remove(currentSession)
+		if currentQConn != nil {
+			tunnelPool.Remove(currentQConn)
+			currentQConn.CloseWithError(0, "reconnecting")
 		}
-		// Clean up old channel resources — erase all chat fingerprints first
 		if currentCh != nil {
-			// Run cleanup asynchronously to not delay reconnection
-			go func(ch *channelState) {
-				ch.client.CleanupMessages()
-			}(currentCh)
-			time.Sleep(500 * time.Millisecond) // brief wait to let cleanup start
+			go func(c *channelState) { c.client.CleanupMessages() }(currentCh)
+			time.Sleep(500 * time.Millisecond)
 			currentCh.sfu.Close()
 			currentCh.client.Close()
 		}
 
-		// Remove from channels slice
 		mu.Lock()
 		for i, c := range *channels {
 			if c == currentCh {
@@ -887,49 +878,37 @@ func (tm *TunnelManager) monitorAndReconnect(
 		}
 		mu.Unlock()
 
-		// Backoff wait before cold reconnect
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
 
-		var newCh *channelState
-		var newSession *yamux.Session
-
-		// Cold reconnection
-		mainLog.Info("[%s] 🔄 Reconnecting...", label)
+		// Reconnect
 		tm.setChannelPhase(idx, PhaseBaleConnect, "")
-		newCh, newSession = tm.initChannelTracked(ctx, idx, tp, label)
-		if newCh == nil || newSession == nil {
+		newCh, newQConn := tm.initChannelTracked(ctx, idx, tp, label)
+		if newCh == nil || newQConn == nil {
 			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
-			backoff = backoff * 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			backoff = min(backoff*2, maxBackoff)
 			continue
 		}
 
-		// Success — add back to pool
 		tm.setChannelPhase(idx, PhaseTunnelActive, "")
-		tunnelPool.Add(newSession, label)
+		tunnelPool.Add(newQConn, label)
 		mu.Lock()
 		*channels = append(*channels, newCh)
 		mu.Unlock()
-		mainLog.Info("[%s] ✅ Reconnected successfully!", label)
+		mainLog.Info("[%s] ✅ Reconnected!", label)
 
-		// Reset backoff on success
 		backoff = 5 * time.Second
-		currentSession = newSession
+		currentQConn = newQConn
 		currentCh = newCh
 
-		// Start proxies if they haven't been started yet (edge case)
 		proxyOnce.Do(func() {
 			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
 			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
 		})
 
-		// Brief stabilization pause before resuming monitoring
 		select {
 		case <-ctx.Done():
 			return
@@ -938,8 +917,16 @@ func (tm *TunnelManager) monitorAndReconnect(
 	}
 }
 
-// initChannelTracked wraps initChannel with phase tracking callbacks.
-func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp config.TokenPair, label string) (*channelState, *yamux.Session) {
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// initChannelTracked establishes: Bale call → SFU → QUIC connection.
+// Returns the channelState and the QUIC connection for the pool.
+func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp config.TokenPair, label string) (*channelState, quic.Connection) {
 	chanCfg := *tm.cfg
 	chanCfg.BaleAccessToken = tp.ClientToken
 	chanCfg.BaleTargetUserID = tp.TargetUserID
@@ -1009,32 +996,39 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	connCancel()
 
 	tm.setChannelPhase(idx, PhaseTunnelSetup, "")
-	dc := sfu.DataConn()
-	if dc == nil {
-		tm.setChannelPhase(idx, PhaseError, "Data channel not ready")
-		mainLog.Info("[%s] DataConn not ready", label)
+	rtpConn := sfu.GetRTPConn()
+	if rtpConn == nil {
+		tm.setChannelPhase(idx, PhaseError, "RTP connection not ready (SFU not in Opus mode)")
+		mainLog.Info("[%s] GetRTPConn returned nil", label)
 		sfu.Close()
 		client.Close()
 		return nil, nil
 	}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (was 30s)
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (was 20s)
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads (was 1MB)
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections (was default 256)
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
+	// Build OpusPacketConn: bridges quic-go to the 20ms-paced Opus RTP track
+	opusPC := quicconn.NewClient(rtpConn)
 
-	session, err := yamux.Client(dc, ymuxCfg)
+	// QUIC config: MTU=1100 (Opus payload limit), PMTUD disabled, keepalives on
+	quicCfg := &quic.Config{
+		MaxIdleTimeout:                  30 * time.Second,
+		KeepAlivePeriod:                 10 * time.Second,
+		InitialStreamReceiveWindow:      1 * 1024 * 1024,  // 1MB
+		MaxStreamReceiveWindow:          16 * 1024 * 1024, // 16MB
+		InitialConnectionReceiveWindow:  2 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      32 * 1024 * 1024,
+		DisablePathMTUDiscovery:         true, // PMTUD breaks over WebRTC virtual transport
+	}
+
+	mainLog.Info("[%s] Dialing QUIC over Opus track (MTU=1100, PMTUD off)...", label)
+	qconn, err := quic.Dial(ctx, opusPC, quicconn.RemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
 	if err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Yamux session failed: "+err.Error())
-		mainLog.Info("[%s] Yamux: %v", label, err)
+		tm.setChannelPhase(idx, PhaseError, "QUIC dial failed: "+err.Error())
+		mainLog.Info("[%s] QUIC dial: %v", label, err)
 		sfu.Close()
 		client.Close()
 		return nil, nil
 	}
+	mainLog.Info("[%s] ✅ QUIC connection established!", label)
 
 	ch := &channelState{
 		index:  tp.Index,
@@ -1043,109 +1037,9 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		sfu:    sfu,
 		cfg:    &chanCfg,
 		pair:   tp,
+		qconn:  qconn,
 	}
-	return ch, session
-}
-
-// initChannel establishes one Bale call → SFU → yamux channel.
-func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPair, label string, obfuscator *dcconn.Obfuscator) (*channelState, *yamux.Session) {
-	// Create a copy of config for this channel
-	chanCfg := *baseCfg
-	chanCfg.BaleAccessToken = tp.ClientToken
-	chanCfg.BaleTargetUserID = tp.TargetUserID
-
-	mainLog.Info("[%s] Connecting to Bale WS...", label)
-	client := bale.NewClient(tp.ClientToken)
-	if err := client.Connect(); err != nil {
-		mainLog.Info("[%s] Bale connect: %v", label, err)
-		return nil, nil
-	}
-	client.StartPingLoop()
-
-	// Warm up: send a greeting message to establish contact
-	// Bale requires prior chat history before allowing calls between strangers
-	mainLog.Info("[%s] Sending warmup message to %d...", label, tp.TargetUserID)
-	client.SendTextMessage(tp.TargetUserID, "BLETUN:PING")
-	time.Sleep(2 * time.Second)
-
-	mainLog.Info("[%s] Calling user %d...", label, tp.TargetUserID)
-	if err := client.StartCall(tp.TargetUserID, true); err != nil {
-		mainLog.Info("[%s] StartCall: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
-
-	mainLog.Info("[%s] Waiting for server to accept (60s)...", label)
-	result, err := client.WaitForAccept(60 * time.Second)
-	if err != nil {
-		mainLog.Info("[%s] WaitForAccept: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
-
-	wssURL := result.WssURL
-	if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
-		wssURL = wssURL[:len(wssURL)-1]
-	}
-	chanCfg.LiveKitToken = result.LivekitToken
-	chanCfg.LiveKitWSURL = wssURL + "/rtc"
-	mainLog.Info("[%s] ✅ Call accepted! Room: %s", label, result.RoomID)
-
-	// Connect to LiveKit SFU
-	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, obfuscator) // Legacy initChannel — obfuscator for anti-DPI
-	if err := sfu.Connect(ctx); err != nil {
-		mainLog.Info("[%s] SFU connect: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
-
-	// Wait for remote track
-	mainLog.Info("[%s] Waiting for server track (30s)...", label)
-	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
-	if err := sfu.WaitForConnection(connCtx); err != nil {
-		connCancel()
-		mainLog.Info("[%s] Connection timeout: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
-	connCancel()
-
-	// Setup yamux
-	dc := sfu.DataConn()
-	if dc == nil {
-		mainLog.Info("[%s] DataConn not ready", label)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
-
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
-
-	session, err := yamux.Client(dc, ymuxCfg)
-	if err != nil {
-		mainLog.Info("[%s] Yamux: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
-
-	ch := &channelState{
-		index:  tp.Index,
-		label:  label,
-		client: client,
-		sfu:    sfu,
-		cfg:    &chanCfg,
-	}
-	return ch, session
+	return ch, qconn
 }
 
 // getLocalIPs returns all non-loopback IPv4 addresses from local network
