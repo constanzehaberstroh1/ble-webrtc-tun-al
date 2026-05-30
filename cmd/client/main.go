@@ -841,11 +841,12 @@ func (tm *TunnelManager) monitorAndReconnect(
 	currentCh := ch
 
 	for {
-		// Wait for session death
+		// REGULATION ENGINE: 5s ping check (was 10s) — faster dead-session detection.
+		// Combined with pool's 2s health monitor, channels reconnect within ~5s of dying.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 			// Check session health proactively using yamux Ping
 			// This detects dead connections faster than waiting for IsClosed()
 			if currentSession != nil && !currentSession.IsClosed() {
