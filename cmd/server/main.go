@@ -134,17 +134,19 @@ func main() {
 		adminPanel.AddLog("info", "Proxy mode — userspace IP relay")
 	}
 
-	// Create obfuscator for anti-DPI payload encryption
+	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
+	// With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP) the data is already triple-encrypted.
+	// Leave OBFUSCATION_SECRET empty for maximum speed — 40 bytes/pkt saved + less CPU.
 	if cfg.ObfuscationSecret != "" {
 		var err error
 		serverObf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
-			mainLog.Info("ChaCha20-Poly1305 obfuscation enabled (overhead: %d bytes/msg)", serverObf.Overhead())
+			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
 		}
 	} else {
-		mainLog.Warn("No OBFUSCATION_SECRET set — traffic is not obfuscated (DPI visible)")
+		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides full encryption. Full MTU available.")
 	}
 
 	// Bale signaling mode: connect to Bale WS, auto-accept calls
@@ -700,8 +702,14 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
+	// InitialPacketSize=1140 when obfuscation is off (full MTU reclaimed).
+	// Falls back to 1100 if obfuscation is on (reserves 40 bytes for XChaCha20).
+	initPktSize := uint16(1140)
+	if serverObf != nil && serverObf.Enabled() {
+		initPktSize = 1100
+	}
 	quicCfg := &quic.Config{
-		InitialPacketSize:               1100,
+		InitialPacketSize:               initPktSize,
 		MaxIdleTimeout:                  60 * time.Second,
 		KeepAlivePeriod:                 15 * time.Second,
 		InitialStreamReceiveWindow:      2 * 1024 * 1024,

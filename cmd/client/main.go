@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -258,7 +257,10 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 	clientID := getOrCreateClientID(database)
 	mainLog.Info("Client ID: %s", clientID)
 
-	// Create obfuscator from shared secret (both client+server must match)
+	// Obfuscation: XChaCha20-Poly1305 over the RTP payloads.
+	// NOTE: With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP), the payload is already
+	// triple-encrypted. Leaving OBFUSCATION_SECRET empty is RECOMMENDED for
+	// maximum speed — it eliminates 40 bytes/pkt overhead and CPU cycles.
 	var obf *dcconn.Obfuscator
 	if cfg.ObfuscationSecret != "" {
 		var err error
@@ -266,10 +268,10 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
-			mainLog.Info("ChaCha20-Poly1305 obfuscation enabled (overhead: %d bytes/msg)", obf.Overhead())
+			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — this is REDUNDANT with QUIC+SRTP and costs 40 bytes/pkt MTU + CPU. Unset OBFUSCATION_SECRET for max speed.")
 		}
 	} else {
-		mainLog.Warn("No OBFUSCATION_SECRET set — traffic is not obfuscated (DPI visible)")
+		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides sufficient encryption. Full MTU available.")
 	}
 
 	return &TunnelManager{
@@ -687,10 +689,15 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	var mu sync.Mutex
 	var proxyOnce sync.Once
 
-	// === SEQUENTIAL CONNECTION ===
-	// Connect pairs ONE AT A TIME to avoid overwhelming Bale's SFU.
-	// Each pair waits for the previous to fully connect or fail before starting.
-	// This respects Bale's rate limiting and prevents signaling races.
+	// === PARALLEL CONNECTION ===
+	// Dial all channels concurrently so the pool is fully populated before
+	// heavy traffic starts. Previously, sequential dialing let ch1 absorb
+	// 100% of traffic while ch2..chN were still handshaking.
+	//
+	// A 500ms stagger per index avoids hammering Bale's signaling server
+	// simultaneously, but total startup time is now ~1 channel RTT + stagger,
+	// instead of N × RTT.
+	var wg sync.WaitGroup
 	for i, pair := range pairs {
 		select {
 		case <-ctx.Done():
@@ -698,55 +705,57 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		default:
 		}
 
-		label := fmt.Sprintf("ch%d", pair.Index)
+		wg.Add(1)
+		go func(i int, pair config.TokenPair) {
+			defer wg.Done()
 
-		// Small stagger between pairs (2-4s) — enough for Bale to process
-		// without triggering anti-spam, but much faster than the old 8-10s.
-		if i > 0 {
-			tm.setChannelPhase(i, PhaseInit, "")
-			delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
-			mainLog.Info("[%s] Waiting %.1fs before connecting (sequential)...", label, delay.Seconds())
-			select {
-			case <-ctx.Done():
+			label := fmt.Sprintf("ch%d", pair.Index)
+
+			// Light stagger: 500ms × index (ch1=0s, ch2=0.5s, ch3=1s, ...)
+			if i > 0 {
+				tm.setChannelPhase(i, PhaseInit, "")
+				stagger := time.Duration(i) * 500 * time.Millisecond
+				mainLog.Info("[%s] 🕐 Stagger %.1fs (parallel dial)...", label, stagger.Seconds())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(stagger):
+				}
+			}
+
+			tm.setChannelPhase(i, PhaseBaleConnect, "")
+			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (parallel)...", label, i+1, len(pairs))
+
+			ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
+			if ch == nil || qconn == nil {
+				mainLog.Warn("[%s] ❌ Channel init failed", label)
+				tm.setChannelPhase(i, PhaseError, "init failed")
 				return
-			case <-time.After(delay):
 			}
-		}
 
-		// Track phases through initChannel
-		tm.setChannelPhase(i, PhaseBaleConnect, "")
-		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (sequential)...", label, i+1, len(pairs))
+			tm.setChannelPhase(i, PhaseTunnelActive, "")
+			tunnelPool.Add(qconn, label)
+			mu.Lock()
+			channels = append(channels, ch)
+			mu.Unlock()
+			mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
 
-		ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
-		if ch == nil || qconn == nil {
-			mainLog.Warn("[%s] ❌ Channel init failed — continuing to next pair", label)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
+			// Start proxies as soon as first channel is ready
+			proxyOnce.Do(func() {
+				go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
+				go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+				mainLog.Info(" ✅ Proxies started (first channel ready)!")
+				for _, ip := range getLocalIPs() {
+					mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+				}
+			})
 
-		tm.setChannelPhase(i, PhaseTunnelActive, "")
-		tunnelPool.Add(qconn, label)
-		mu.Lock()
-		channels = append(channels, ch)
-		mu.Unlock()
-		mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
-
-		// Start proxies on all interfaces as soon as first channel connects
-		proxyOnce.Do(func() {
-			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-			mainLog.Info(" ✅ Proxies started on ALL interfaces (first channel ready)!")
-			for _, ip := range getLocalIPs() {
-				mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-			}
-		})
-
-		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+			go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+		}(i, pair)
 	}
+
+	// Wait for all parallel dials to complete
+	wg.Wait()
 
 	if ctx.Err() != nil {
 		return
@@ -1008,17 +1017,20 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	// Build OpusPacketConn: bridges quic-go to the 20ms-paced Opus RTP track
 	opusPC := quicconn.NewClient(rtpConn)
 
-	// QUIC config: InitialPacketSize=1100 ensures encrypted datagrams fit
-	// within the Opus payload limit after XChaCha20-Poly1305 overhead (~40 bytes).
-	// Large windows prevent QUIC from stalling on WebRTC's inherent jitter.
+	// QUIC config: InitialPacketSize=1140 (no obfuscation overhead to reserve for).
+	// If obfuscation is enabled, reduce to 1100 to leave room for XChaCha20 (+40 bytes).
+	initPktSize := uint16(1140)
+	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
+		initPktSize = 1100
+	}
 	quicCfg := &quic.Config{
-		InitialPacketSize:               1100,
+		InitialPacketSize:               initPktSize,
 		MaxIdleTimeout:                  60 * time.Second,
 		KeepAlivePeriod:                 15 * time.Second,
-		InitialStreamReceiveWindow:      2 * 1024 * 1024,  // 2MB
-		MaxStreamReceiveWindow:          8 * 1024 * 1024,  // 8MB per stream
+		InitialStreamReceiveWindow:      2 * 1024 * 1024,
+		MaxStreamReceiveWindow:          8 * 1024 * 1024,
 		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      16 * 1024 * 1024, // 16MB total
+		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
 		DisablePathMTUDiscovery:         true,
 	}
 
