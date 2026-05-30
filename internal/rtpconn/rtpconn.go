@@ -4,8 +4,12 @@
 // payloads. Incoming RTP payloads are decrypted before delivery.
 // DPI sees a normal Opus voice call; the SFU sees opaque audio data.
 //
-// No framing is added — yamux provides its own reliable framing layer
-// on top of this raw byte pipe.
+// REGULATION ENGINE (20ms Pacer):
+// The SFU audio policer expects exactly one Opus frame every 20ms (~50 pps).
+// Writing faster causes burst drops that trigger KCP retransmissions that
+// trigger more drops — a death spiral. The pacer goroutine enforces strict
+// 20ms cadence: data frames are queued and drained one-per-tick.
+// When the queue is empty, a 3-byte silence frame keeps the track alive.
 package rtpconn
 
 import (
@@ -28,22 +32,28 @@ const (
 	// Account for obfuscation overhead (40 bytes) to stay under MTU.
 	maxPlainChunkSize = 1160 // 1200 - 40 (nonce + tag) = 1160 bytes of plaintext per packet
 
-	// sampleDuration is the fake Opus frame duration (20ms is standard).
+	// sampleDuration is the Opus frame duration — must match the pacer interval.
 	sampleDuration = 20 * time.Millisecond
 
 	// readChSize is the channel buffer for incoming RTP payloads.
 	readChSize = 8192
 
-	// silenceInterval is how often to send a silence frame when idle.
-	silenceInterval = 20 * time.Millisecond
+	// pacerQueueSize is the max number of outbound frames queued.
+	// 512 frames × 20ms = ~10.2 seconds of buffer — enough for bursts.
+	pacerQueueSize = 512
 )
+
+// minimalOpusSilence is a 3-byte comfort-noise silence frame (RFC 6716).
+// The SFU and remote peer treat this as a real Opus frame, keeping the
+// track alive without consuming meaningful bandwidth.
+var minimalOpusSilence = []byte{0xF8, 0xFF, 0xFE}
 
 // Conn wraps a local audio track (for writing) and delivers incoming
 // RTP payloads (for reading) as an io.ReadWriteCloser for yamux.
 type Conn struct {
 	localTrack *webrtc.TrackLocalStaticSample
 	readCh     chan []byte // incoming RTP payloads (decrypted)
-	buf        []byte      // partial read buffer
+	buf        []byte     // partial read buffer
 	closed     atomic.Bool
 	once       sync.Once
 	done       chan struct{}
@@ -52,8 +62,10 @@ type Conn struct {
 	// If nil, payloads pass through unencrypted (backwards compatible).
 	obfuscator *dcconn.Obfuscator
 
-	// Write serialization
-	writeMu sync.Mutex
+	// Write serialization — all writes go through the pacer queue.
+	// The pacer goroutine drains the queue at exactly 20ms intervals,
+	// enforcing the SFU audio policer's expected packet rate.
+	outboundQueue chan []byte // encrypted frames waiting to be paced
 
 	bytesSent atomic.Int64
 	bytesRecv atomic.Int64
@@ -61,19 +73,61 @@ type Conn struct {
 
 // New creates a Conn. The localTrack is used for sending data;
 // incoming data is fed via HandleRTP from the OnTrack callback.
-// obfuscator encrypts payloads before they enter the RTP track;
-// pass nil for no encryption (backwards compatible but DPI-visible).
+// obfuscator encrypts payloads before they enter the RTP track.
+// The 20ms pacer goroutine starts automatically.
 func New(localTrack *webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
 	c := &Conn{
-		localTrack: localTrack,
-		readCh:     make(chan []byte, readChSize),
-		done:       make(chan struct{}),
-		obfuscator: obfuscator,
+		localTrack:    localTrack,
+		readCh:        make(chan []byte, readChSize),
+		done:          make(chan struct{}),
+		obfuscator:    obfuscator,
+		outboundQueue: make(chan []byte, pacerQueueSize),
 	}
 	if obfuscator != nil && obfuscator.Enabled() {
 		rtpLog.Info("RTP obfuscation enabled (XChaCha20-Poly1305, overhead: %d bytes/pkt)", obfuscator.Overhead())
 	}
+	// Start the Regulation Engine pacer — enforces 20ms Opus cadence
+	go c.pacerLoop()
 	return c
+}
+
+// pacerLoop is the Regulation Engine core.
+// It runs at exactly 20ms intervals, sending one RTP frame per tick.
+// When the outboundQueue has data, it sends real VPN payload.
+// When empty, it sends a 3-byte Opus silence frame to keep the track alive.
+//
+// This prevents SFU audio policer drops by never exceeding 50 pps.
+func (c *Conn) pacerLoop() {
+	ticker := time.NewTicker(sampleDuration)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			if c.closed.Load() {
+				return
+			}
+			select {
+			case pkt := <-c.outboundQueue:
+				// Real data frame — send it to the SFU
+				_ = c.localTrack.WriteSample(media.Sample{
+					Data:     pkt,
+					Duration: sampleDuration,
+				})
+			default:
+				// No data queued — send silence to keep the Opus track alive.
+				// The SFU must receive continuous audio to maintain the call;
+				// silence frames are 3 bytes (vs ~1100 for data) so they're
+				// essentially free in bandwidth terms.
+				_ = c.localTrack.WriteSample(media.Sample{
+					Data:     minimalOpusSilence,
+					Duration: sampleDuration,
+				})
+			}
+		}
+	}
 }
 
 // HandleRTP should be called from the OnTrack ReadRTP loop.
@@ -138,10 +192,18 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 }
 
-// Write implements io.Writer. Encrypts data (if obfuscation is enabled)
-// and writes as Opus audio samples. Large writes are split into MTU-safe
-// chunks. No framing header is added — yamux provides its own
-// length-prefixed framing layer.
+// Write implements io.Writer.
+// Encrypts data (if obfuscation is enabled), splits into MTU-safe chunks,
+// and enqueues each chunk for paced delivery at 20ms intervals.
+//
+// IMPORTANT: This method does NOT write to the RTP track directly.
+// The pacerLoop() goroutine drains the outboundQueue at 20ms cadence.
+// This ensures the SFU never receives more than ~50 packets/second,
+// preventing audio policer drops.
+//
+// Backpressure: If the queue is full (512 frames = ~10s of data queued),
+// Write() blocks until space is available. This naturally slows down
+// KCP/yamux without causing goroutine leaks.
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
@@ -149,9 +211,6 @@ func (c *Conn) Write(p []byte) (int, error) {
 	if c.localTrack == nil {
 		return 0, fmt.Errorf("no local track")
 	}
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 
 	totalLen := len(p)
 	remaining := p
@@ -179,12 +238,11 @@ func (c *Conn) Write(p []byte) (int, error) {
 			data = encrypted
 		}
 
-		// Write as Opus sample — DPI sees a normal audio frame
-		if err := c.localTrack.WriteSample(media.Sample{
-			Data:     data,
-			Duration: sampleDuration,
-		}); err != nil {
-			return 0, fmt.Errorf("write sample: %w", err)
+		// Enqueue for paced delivery — block if queue is full (backpressure)
+		select {
+		case c.outboundQueue <- data:
+		case <-c.done:
+			return 0, io.ErrClosedPipe
 		}
 	}
 
@@ -192,31 +250,12 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return totalLen, nil
 }
 
-// StartSilenceLoop sends periodic silence frames to keep the audio
-// track alive when no data is being sent.
+// StartSilenceLoop is a no-op. The pacerLoop() goroutine handles silence
+// frames automatically when the outboundQueue is empty. This stub is kept
+// for API compatibility with sfutransport.go callers.
 func (c *Conn) StartSilenceLoop() {
-	go func() {
-		// Minimal Opus silence frame (single byte)
-		silence := []byte{0xF8, 0xFF, 0xFE}
-
-		ticker := time.NewTicker(silenceInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-c.done:
-				return
-			case <-ticker.C:
-				if c.closed.Load() {
-					return
-				}
-				c.localTrack.WriteSample(media.Sample{
-					Data:     silence,
-					Duration: sampleDuration,
-				})
-			}
-		}
-	}()
+	// No-op: silence is now handled by pacerLoop()
+	rtpLog.Info("StartSilenceLoop() called — silence is now managed by the 20ms pacer (no-op)")
 }
 
 // Close implements io.Closer.
@@ -232,6 +271,12 @@ func (c *Conn) Close() error {
 // Stats returns bytes sent/received.
 func (c *Conn) Stats() (sent, recv int64) {
 	return c.bytesSent.Load(), c.bytesRecv.Load()
+}
+
+// QueueDepth returns the number of frames currently waiting in the pacer queue.
+// Useful for monitoring backpressure.
+func (c *Conn) QueueDepth() int {
+	return len(c.outboundQueue)
 }
 
 // isOpusSilence detects standard Opus comfort noise / silence frames

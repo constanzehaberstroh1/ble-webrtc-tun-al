@@ -63,17 +63,28 @@ func WrapWithSecret(underlying io.ReadWriteCloser, secret string) *Conn {
 		}
 	})
 
-	// Tune KCP for maximum throughput over a lossy, high-latency SFU relay:
-	// - NoDelay=1: disable delayed ACK
-	// - Interval=10ms: fast update interval
-	// - Resend=2: fast resend on 2 duplicate ACKs
-	// - NC=1: disable congestion control (we manage bandwidth externally)
-	c.kcp.NoDelay(1, 10, 2, 1)
+	// REGULATION ENGINE — KCP parameters tuned to cooperate with the 20ms pacer.
+	//
+	// With the pacer enforcing strict 20ms cadence, it is now SAFE to re-enable
+	// KCP congestion control (NC=0). Previously NC=1 was used to maximize
+	// throughput, but it caused an ARQ death spiral:
+	//   burst write → SFU policer drops packet → KCP blasts retransmissions
+	//   → SFU drops more → KCP blasts more → spiral until connection dies
+	//
+	// With NC=0 + the pacer: KCP backs off gracefully when the SFU drops a
+	// packet instead of flooding the track. The pacer absorbs the backpressure.
+	//
+	// - NoDelay=1:   disable delayed ACK (still want fast ACKs)
+	// - Interval=20: match the 20ms pacer cadence
+	// - Resend=2:    fast resend on 2 duplicate ACKs
+	// - NC=0:        enable congestion control (safe now with the pacer)
+	c.kcp.NoDelay(1, 20, 2, 0)
 
-	// Large window sizes (in packets) — critical for high-bandwidth downloads.
-	// With MTU=1100 and window=2048: up to ~2.2MB in-flight data.
-	// Previous value of 256 caused deadlocks during streaming.
-	c.kcp.WndSize(2048, 2048)
+	// Window size: 512 packets × 1100 bytes = ~550KB in-flight.
+	// At 20ms RTT: 550KB / 0.02s = 22 MB/s theoretical — far above what one
+	// Opus track can deliver, so the window is never the bottleneck.
+	// Reduced from 2048 to prevent memory waste and burst amplification.
+	c.kcp.WndSize(512, 512)
 
 	// Max segment size: match the Opus RTP payload capacity.
 	// rtpconn uses maxPlainChunkSize=1160 (minus obfuscation overhead).
@@ -140,8 +151,10 @@ func (c *Conn) Close() error {
 }
 
 // updateLoop periodically ticks KCP update for packet pacing & retransmissions.
+// Interval matches the pacer cadence (20ms) — no benefit in ticking faster
+// since the pacer drains at 20ms anyway.
 func (c *Conn) updateLoop() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
