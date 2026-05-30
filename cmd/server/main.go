@@ -701,13 +701,14 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		return
 	}
 	quicCfg := &quic.Config{
-		MaxIdleTimeout:                 30 * time.Second,
-		KeepAlivePeriod:                10 * time.Second,
-		InitialStreamReceiveWindow:     1 * 1024 * 1024,
-		MaxStreamReceiveWindow:         16 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 2 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
-		DisablePathMTUDiscovery:        true,
+		InitialPacketSize:               1100,
+		MaxIdleTimeout:                  60 * time.Second,
+		KeepAlivePeriod:                 15 * time.Second,
+		InitialStreamReceiveWindow:      2 * 1024 * 1024,
+		MaxStreamReceiveWindow:          8 * 1024 * 1024,
+		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
+		DisablePathMTUDiscovery:         true,
 	}
 
 	listener, err := quic.Listen(opusPC, tlsCfg, quicCfg)

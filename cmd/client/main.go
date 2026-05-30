@@ -1008,15 +1008,18 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	// Build OpusPacketConn: bridges quic-go to the 20ms-paced Opus RTP track
 	opusPC := quicconn.NewClient(rtpConn)
 
-	// QUIC config: MTU=1100 (Opus payload limit), PMTUD disabled, keepalives on
+	// QUIC config: InitialPacketSize=1100 ensures encrypted datagrams fit
+	// within the Opus payload limit after XChaCha20-Poly1305 overhead (~40 bytes).
+	// Large windows prevent QUIC from stalling on WebRTC's inherent jitter.
 	quicCfg := &quic.Config{
-		MaxIdleTimeout:                  30 * time.Second,
-		KeepAlivePeriod:                 10 * time.Second,
-		InitialStreamReceiveWindow:      1 * 1024 * 1024,  // 1MB
-		MaxStreamReceiveWindow:          16 * 1024 * 1024, // 16MB
-		InitialConnectionReceiveWindow:  2 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      32 * 1024 * 1024,
-		DisablePathMTUDiscovery:         true, // PMTUD breaks over WebRTC virtual transport
+		InitialPacketSize:               1100,
+		MaxIdleTimeout:                  60 * time.Second,
+		KeepAlivePeriod:                 15 * time.Second,
+		InitialStreamReceiveWindow:      2 * 1024 * 1024,  // 2MB
+		MaxStreamReceiveWindow:          8 * 1024 * 1024,  // 8MB per stream
+		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      16 * 1024 * 1024, // 16MB total
+		DisablePathMTUDiscovery:         true,
 	}
 
 	mainLog.Info("[%s] Dialing QUIC over Opus track (MTU=1100, PMTUD off)...", label)
