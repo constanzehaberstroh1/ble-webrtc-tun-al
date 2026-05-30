@@ -711,11 +711,12 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 			label := fmt.Sprintf("ch%d", pair.Index)
 
-			// Light stagger: 500ms × index (ch1=0s, ch2=0.5s, ch3=1s, ...)
+			// Stagger: 2s × index — lets each ICE negotiation settle before next starts.
+			// (ch1=0s, ch2=2s, ch3=4s, ch4=6s, ch5=8s — still 4x faster than sequential)
 			if i > 0 {
 				tm.setChannelPhase(i, PhaseInit, "")
-				stagger := time.Duration(i) * 500 * time.Millisecond
-				mainLog.Info("[%s] 🕐 Stagger %.1fs (parallel dial)...", label, stagger.Seconds())
+				stagger := time.Duration(i) * 2 * time.Second
+				mainLog.Info("[%s] 🕐 Stagger %.0fs (parallel dial)...", label, stagger.Seconds())
 				select {
 				case <-ctx.Done():
 					return
@@ -1005,6 +1006,16 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	connCancel()
 
 	tm.setChannelPhase(idx, PhaseTunnelSetup, "")
+	// Brief pause: the server sets up quic.Listen() after its own WaitForConnection.
+	// The server's WaitForConnection fires when OUR track arrives at the SFU;
+	// ours fires when the SERVER's track arrives — these events are not synchronized.
+	// Without this wait, we may call quic.Dial() before the server is listening.
+	select {
+	case <-ctx.Done():
+		return nil, nil
+	case <-time.After(1500 * time.Millisecond):
+	}
+
 	rtpConn := sfu.GetRTPConn()
 	if rtpConn == nil {
 		tm.setChannelPhase(idx, PhaseError, "RTP connection not ready (SFU not in Opus mode)")
