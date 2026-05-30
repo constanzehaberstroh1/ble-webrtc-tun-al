@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -14,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/admin"
 	"github.com/salman/ble-webrtc-tun/internal/api"
@@ -24,6 +25,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
+	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
 	"github.com/salman/ble-webrtc-tun/internal/transport"
 )
@@ -685,31 +687,50 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		s.TunnelActive = true
 	})
 
-	// Setup yamux server session over DataChannel
-	dc := sfu.DataConn()
-	if dc == nil {
-		adminPanel.AddLog("error", tag+" DataConn not ready")
+	// Setup QUIC server over the Opus RTP track
+	rtpConn := sfu.GetRTPConn()
+	if rtpConn == nil {
+		adminPanel.AddLog("error", tag+" RTP connection not ready")
 		return
 	}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (match client)
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (match client)
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — must match client (was 1MB)
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
-
-	session, err := yamux.Server(dc, ymuxCfg)
+	opusPC := quicconn.NewServer(rtpConn)
+	tlsCfg, err := quicconn.ServerTLSConfig()
 	if err != nil {
-		adminPanel.AddLog("error", tag+" Yamux server: "+err.Error())
+		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	defer session.Close()
+	quicCfg := &quic.Config{
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		InitialStreamReceiveWindow:     1 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 2 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
+		DisablePathMTUDiscovery:        true,
+	}
 
-	mainLog.Info("%s Yamux proxy active", tag)
-	go handleYamuxSession(session)
+	listener, err := quic.Listen(opusPC, tlsCfg, quicCfg)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC listen failed: "+err.Error())
+		return
+	}
+	defer listener.Close()
+	mainLog.Info("%s QUIC listener ready", tag)
+
+	// Accept the single QUIC connection from the client
+	accCtx, accCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer accCancel()
+	qconn, err := listener.Accept(accCtx)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC accept timeout: "+err.Error())
+		return
+	}
+	mainLog.Info("%s QUIC client connected — proxy active", tag)
+	adminPanel.AddLog("info", tag+" ✅ QUIC tunnel established!")
+	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
+
+	go handleQUICConn(ctx, qconn)
 
 	// Monitor
 	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
@@ -769,10 +790,13 @@ drainLoop:
 				continue
 			}
 		case <-ticker.C:
-			if session.IsClosed() {
-				adminPanel.AddLog("warn", tag+" Yamux session closed")
-				mainLog.Info("%s Yamux session closed", tag)
+			// Check QUIC connection health via context
+			select {
+			case <-qconn.Context().Done():
+				adminPanel.AddLog("warn", tag+" QUIC connection closed")
+				mainLog.Info("%s QUIC connection closed", tag)
 				return
+			default:
 			}
 			stats := sfu.GetStats()
 			bytesSent, _ := stats["bytes_sent"].(int64)
@@ -785,10 +809,68 @@ drainLoop:
 				s.PrevBytesRecv = bytesRecv
 				s.BytesSent = bytesSent
 				s.BytesReceived = bytesRecv
-				s.ActiveConns = session.NumStreams()
 			})
 		}
 	}
+}
+
+// handleQUICConn accepts QUIC streams from the client and proxies each to the internet.
+// One goroutine per stream — QUIC provides per-stream ordering so no HoL blocking.
+func handleQUICConn(ctx context.Context, conn quic.Connection) {
+	for {
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			// Connection closed or context cancelled
+			mainLog.Info("[QUIC] AcceptStream ended: %v", err)
+			return
+		}
+		go handleQUICStream(stream)
+	}
+}
+
+// handleQUICStream reads the target address header then relays data bidirectionally.
+// Protocol (matches client dialAndRelay): [uint16 len][addr bytes] then raw TCP data.
+func handleQUICStream(stream quic.Stream) {
+	defer stream.Close()
+
+	// Read 2-byte length prefix
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		mainLog.Info("[QUIC-Stream] read addr len: %v", err)
+		return
+	}
+	addrLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+	if addrLen == 0 || addrLen > 512 {
+		mainLog.Info("[QUIC-Stream] invalid addr len: %d", addrLen)
+		return
+	}
+
+	// Read target address
+	addrBuf := make([]byte, addrLen)
+	if _, err := io.ReadFull(stream, addrBuf); err != nil {
+		mainLog.Info("[QUIC-Stream] read addr: %v", err)
+		return
+	}
+	targetAddr := string(addrBuf)
+	mainLog.Info("[QUIC-Stream] Proxying to %s", targetAddr)
+
+	// Dial the target
+	remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	if err != nil {
+		mainLog.Info("[QUIC-Stream] dial %s: %v", targetAddr, err)
+		return
+	}
+	defer remote.Close()
+
+	// Bidirectional relay
+	done := make(chan struct{}, 2)
+	copy := func(dst io.Writer, src io.Reader) {
+		io.Copy(dst, src)
+		done <- struct{}{}
+	}
+	go copy(remote, stream)
+	go copy(stream, remote)
+	<-done
 }
 
 // handleBaleProxy handles one tunnel session: SDP exchange → WebRTC → proxy traffic.
