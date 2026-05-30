@@ -727,8 +727,9 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	defer listener.Close()
 	mainLog.Info("%s QUIC listener ready", tag)
 
-	// Accept the single QUIC connection from the client
-	accCtx, accCancel := context.WithTimeout(ctx, 30*time.Second)
+	// Accept the single QUIC connection from the client.
+	// Timeout: 60s (client waits 1.5s after WaitForConnection + ICE jitter).
+	accCtx, accCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer accCancel()
 	qconn, err := listener.Accept(accCtx)
 	if err != nil {
