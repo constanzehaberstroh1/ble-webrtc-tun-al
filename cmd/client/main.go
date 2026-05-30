@@ -1059,10 +1059,12 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	}
 	quicCfg := &quic.Config{
 		InitialPacketSize:               initPktSize,
-		MaxIdleTimeout:                  60 * time.Second,
-		KeepAlivePeriod:                 15 * time.Second,
+		MaxIdleTimeout:                  30 * time.Second,
+		KeepAlivePeriod:                 10 * time.Second,
+		MaxIncomingStreams:              10000, // prevent stream-credit exhaustion
+		MaxIncomingUniStreams:           10000,
 		InitialStreamReceiveWindow:      2 * 1024 * 1024,
-		MaxStreamReceiveWindow:          8 * 1024 * 1024,
+		MaxStreamReceiveWindow:          16 * 1024 * 1024,
 		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
 		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
 		DisablePathMTUDiscovery:         true,
