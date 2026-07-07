@@ -933,12 +933,17 @@ func (tm *TunnelManager) monitorAndReconnect(
 		}
 
 		// ── Liveness probes ───────────────────────────────────────────────
-		// FIX (Hole 1 — Zombie Spin): if both pointers are nil (e.g. after a
-		// catastrophic refresh failure that did NOT set PhaseError), force dead=true
-		// so the death-reconnect path below immediately kicks in instead of
-		// continuing the loop with no work being done.
+		// FIX (Hole 3 — Dynamic Nil State Fall-Through):
+		// If both pointers are nil after a partial failure (e.g. a context
+		// interruption mid-handshake), check whether the phase is PhaseError
+		// (fatal → exit the goroutine) or anything else (non-fatal → force
+		// dead=true so the death-reconnect path below immediately fires).
+		// Without this explicit dead=true, the liveness checks at the bottom
+		// both skip (nil guards) and the loop spins on continue indefinitely.
+		dead := false
+		reason := ""
+
 		if currentCh == nil && currentQConn == nil {
-			// Check phase in case we should exit entirely.
 			tm.channelMu.RLock()
 			var curPhase ChannelPhase
 			if idx < len(tm.channelStatus) {
@@ -949,12 +954,11 @@ func (tm *TunnelManager) monitorAndReconnect(
 				mainLog.Error("[%s] ❌ PhaseError with nil channel — terminating monitor goroutine", label)
 				return
 			}
-			// Non-fatal nil state: fall through as dead so the reconnect runs.
+			// Non-fatal nil: force recovery instead of a blank continue.
+			mainLog.Warn("[%s] ⚠️  Ghost state detected (nil pointers, phase=%s) — forcing reconnect", label, curPhase)
+			dead = true
+			reason = "ghost nil pointers"
 		}
-
-		// ── Liveness probes ───────────────────────────────────────────────
-		dead := false
-		reason := ""
 
 		// Check 1: QUIC connection context (catches circuit-breaker kills too)
 		if currentQConn != nil {
@@ -1096,17 +1100,6 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	connCancel()
 
 	tm.setChannelPhase(idx, PhaseTunnelSetup, "")
-	// Brief pause: the server sets up quic.Listen() after its own WaitForConnection.
-	// The server's WaitForConnection fires when OUR track arrives at the SFU;
-	// ours fires when the SERVER's track arrives — these events are not synchronized.
-	// Without this wait, we may call quic.Dial() before the server is listening.
-	select {
-	case <-ctx.Done():
-		sfu.Close()
-		client.Close()
-		return nil, nil, PhaseTunnelSetup, fmt.Errorf("cancelled during setup pause")
-	case <-time.After(1500 * time.Millisecond):
-	}
 
 	rtpConn := sfu.GetRTPConn()
 	if rtpConn == nil {
@@ -1140,15 +1133,54 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		DisablePathMTUDiscovery:        true,
 	}
 
-	mainLog.Info("[%s] Dialing QUIC over Opus track (MTU=1100, PMTUD off)...", label)
-	qconn, err = quic.Dial(ctx, opusPC, quicconn.RemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
-	if err != nil {
-		errStr := "QUIC dial failed: " + err.Error()
+	// FIX (Hole 2 — Adaptive Micro-Retry Dialing):
+	// Previously a hardcoded 1.5s blind sleep preceded a single quic.Dial
+	// attempt. On congested or DPI-filtered networks the server's quic.Listen()
+	// may not be ready within that window, causing an immediate failure that
+	// triggers a full Layer 2 teardown loop unnecessarily.
+	//
+	// Instead: poll with exponential back-off (250ms → 500ms → 1s) for up to
+	// 5 seconds. The first successful dial breaks out; only a full 5s timeout
+	// escalates to the caller as a hard error. This keeps transient setup
+	// delays fully contained within the setup phase.
+	mainLog.Info("[%s] Dialing QUIC over Opus track (adaptive micro-retry, up to 5s)...", label)
+
+	var qErr error
+	dialDeadline := time.Now().Add(5 * time.Second)
+	retryDelay := 250 * time.Millisecond
+
+	for time.Now().Before(dialDeadline) {
+		select {
+		case <-ctx.Done():
+			sfu.Close()
+			client.Close()
+			return nil, nil, PhaseTunnelSetup, fmt.Errorf("cancelled during setup phase")
+		default:
+		}
+
+		qconn, qErr = quic.Dial(ctx, opusPC, quicconn.RemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
+		if qErr == nil {
+			break // connected
+		}
+
+		mainLog.Debug("[%s] QUIC not ready yet (%v) — retrying in %v", label, qErr, retryDelay)
+		select {
+		case <-ctx.Done():
+			sfu.Close()
+			client.Close()
+			return nil, nil, PhaseTunnelSetup, fmt.Errorf("cancelled during setup phase")
+		case <-time.After(retryDelay):
+		}
+		retryDelay = min(retryDelay*2, 1*time.Second)
+	}
+
+	if qErr != nil {
+		errStr := "QUIC dial failed after retries: " + qErr.Error()
 		tm.setChannelPhase(idx, PhaseError, errStr)
-		mainLog.Info("[%s] QUIC dial: %v", label, err)
+		mainLog.Info("[%s] QUIC dial: %v", label, qErr)
 		sfu.Close()
 		client.Close()
-		return nil, nil, PhaseTunnelSetup, fmt.Errorf("%w", err)
+		return nil, nil, PhaseTunnelSetup, fmt.Errorf("%w", qErr)
 	}
 	mainLog.Info("[%s] ✅ QUIC connection established!", label)
 

@@ -300,8 +300,15 @@ func (tm *TunnelManager) refreshChannel(
 ) {
 	// 1. Drop the QUIC connection from the routing pool FIRST so the
 	//    round-robin balancer immediately steers traffic to other channels.
+	//
+	// FIX (Hole 1 — Graceful Traffic Drain):
+	// Remove from pool first to block new stream assignments, then wait 3s
+	// for in-flight bytes on active multiplexed streams to finish flushing
+	// before issuing the hard CloseWithError. Without the drain window,
+	// active downloads or long-lived API requests are killed mid-transfer.
 	if *curQ != nil {
 		tunnelPool.Remove(*curQ)
+		time.Sleep(3 * time.Second) // allow active streams to drain
 		(*curQ).CloseWithError(0, "refresh/reconnect")
 		*curQ = nil
 	}
