@@ -1246,6 +1246,10 @@ func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.Tu
 		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
 		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
 		DisablePathMTUDiscovery:        true,
+		// EnableDatagrams enables RFC 9221 QUIC datagrams.
+		// Required for future BBR-via-datagram feedback integration;
+		// harmless when not used (QUIC still operates normally).
+		EnableDatagrams:               true,
 	}
 
 	mainLog.Info("[Bond] Dialing master QUIC connection over bonded transport (%d lanes)...", bc.LaneCount())

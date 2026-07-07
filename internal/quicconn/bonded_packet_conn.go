@@ -1,37 +1,37 @@
 // Package quicconn — bonded_packet_conn.go
 //
 // BondedPacketConn implements net.PacketConn over N concurrent WebRTC
-// audio tracks. It provides:
+// audio tracks with:
 //
-//   - Packet-level striping (Interleaved Weighted Round-Robin across N lanes)
-//   - 4+1 Reed-Solomon Forward Error Correction (zero-duplicate pipeline)
-//   - Speculative hedging for high-priority control packets
-//   - Sliding-window jitter reorder buffer (see reorder_buffer.go)
-//   - sync.Pool pre-allocation for zero-copy, GC-pressure-free networking
+//   - True Interleaved WRR packet striping (all paths, including FEC shards)
+//   - 4+1 Reed-Solomon FEC with explicit GroupID wire headers
+//   - Speculative hedging for QUIC handshake packets (top-N lanes by weight)
+//   - Adaptive sliding-window jitter reorder buffer (see reorder_buffer.go)
+//   - sync.Pool pre-allocation throughout (zero GC pressure in hot path)
 //
-// Wire header (4 bytes prepended to every packet):
+// Wire header (5 bytes — UPDATED from 4 to include GroupID + ShardIdx):
 //
-//	┌──────────┬──────────┬────────┬────────┐
-//	│ seq[0:1] │ chanID   │ flags  │ grpIdx │
-//	│ uint16   │ uint8    │ uint8  │ uint8  │
-//	└──────────┴──────────┴────────┴────────┘
+//	┌──────────┬────────┬────────┬────────────┐
+//	│ seq[0:1] │ flags  │ grpID  │  shardIdx  │
+//	│ uint16   │ uint8  │ uint8  │ uint8      │
+//	└──────────┴────────┴────────┴────────────┘
 //
-//	seq    — global packet sequence (uint16, wraps at 65536)
-//	chanID — originating lane index (0..N-1)
-//	flags  — bit 0: IS_PARITY  (FEC parity shard)
-//	         bit 1: IS_HEDGED  (speculative duplicate)
-//	         bit 2: IS_FEC_DATA (part of a 4+1 group, not a standalone pkt)
-//	grpIdx — index within the FEC group (0..4), 0xFF for non-FEC packets
+//	seq      — global monotonic packet sequence (uint16, wraps at 65536)
+//	flags    — bit 0: IS_PARITY   (FEC parity shard)
+//	           bit 1: IS_HEDGED   (speculative duplicate, dedup on receipt)
+//	           bit 2: IS_FEC_DATA (data shard belonging to a 4+1 group)
+//	grpID    — wrapping 8-bit group counter; ties shards to their group
+//	           independent of the global seq number. 0xFF = non-FEC packet.
+//	shardIdx — index within the group (0..3 = data, 4 = parity, 0xFF = N/A)
 //
-// FEC design (FIXED — zero-duplicate pipeline):
-//   Packets are HELD in memory until the 4-packet group is complete.
-//   The group is encoded ONCE, producing 5 shards. All 5 are emitted
-//   sequentially with monotonic sequence IDs. No packet is ever sent twice.
+// FEC design:
+//   All 4 data packets are HELD until the group is complete, then all 5
+//   shards are emitted exactly once through the WRR selector (not modulo).
 //
-// Weighted Round-Robin (FIXED — Interleaved WRR):
-//   Lane weights are computed from receive-rate health metrics every 500ms.
-//   pickLane() uses the Interleaved WRR algorithm (GCD + max-weight cursor)
-//   so that faster lanes carry proportionally more traffic.
+// WRR design:
+//   Interleaved WRR (Katevenis) with per-lane weights recomputed every 500ms
+//   from a receive-rate / RTT proxy. ALL packet types (direct, FEC data, parity,
+//   hedged) go through the same pickLane() call — no bypass paths.
 package quicconn
 
 import (
@@ -51,37 +51,33 @@ import (
 var bondLog = logger.New("bond")
 
 const (
-	bondHeaderSize = 4 // [seq uint16][chanID uint8][flags uint8]
+	// bondHeaderSize: 5 bytes (seq:2 + flags:1 + grpID:1 + shardIdx:1).
+	// Hole 3 fix: explicit GroupID decouples FEC reconstruction from global seq.
+	bondHeaderSize = 5
 
-	// FEC parameters: 4 data shards + 1 parity shard.
 	fecDataShards   = 4
 	fecParityShards = 1
 	fecTotalShards  = fecDataShards + fecParityShards
 
-	// Flag bits in the header flags byte.
-	flagParity  = 1 << 0
-	flagHedged  = 1 << 1
-	flagFECData = 1 << 2 // data shard that belongs to a FEC group
+	// Header flag bits.
+	flagParity  = uint8(1 << 0) // IS_PARITY: this is an RS parity shard
+	flagHedged  = uint8(1 << 1) // IS_HEDGED: speculative duplicate, dedup on rx
+	flagFECData = uint8(1 << 2) // IS_FEC_DATA: data shard in a 4+1 group
 
-	// Minimum lanes needed before FEC is activated.
-	fecMinLanes = 2
+	// Sentinel values for non-FEC packets.
+	grpIDNone    = uint8(0xFF)
+	shardIdxNone = uint8(0xFF)
 
-	// Weight sampling interval.
+	fecMinLanes          = 2
 	weightSampleInterval = 500 * time.Millisecond
 
-	// Maximum payload size after the 4-byte bond header.
-	// rtpconn accepts up to ~1140 bytes; subtract bond header.
-	maxBondPayload = 1136
-
-	// Buffer pool slab size — large enough for any bond frame.
-	poolSlabSize = maxBondPayload + bondHeaderSize + 64
+	// maxBondPayload: 1135 bytes (1140 rtpconn limit − 5-byte bond header).
+	maxBondPayload = 1135
+	poolSlabSize   = maxBondPayload + bondHeaderSize + 64 // 1264 bytes per slab
 )
 
-// ── Global buffer pool (Phase 5: zero-copy, GC-pressure-free) ─────────────────
-//
-// All lane reads and header-prepend operations lease slabs from this pool
-// instead of calling make([]byte, ...) inline. After the reorder buffer
-// delivers a packet to QUIC, the slab is returned to the pool.
+// ── Global buffer pool (Phase 5 / zero-copy) ──────────────────────────────────
+
 var bondBufPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, poolSlabSize)
@@ -91,13 +87,12 @@ var bondBufPool = sync.Pool{
 
 func getPoolBuf() []byte {
 	p := bondBufPool.Get().(*[]byte)
-	b := *p
-	return b[:poolSlabSize]
+	return (*p)[:poolSlabSize]
 }
 
 func putPoolBuf(b []byte) {
 	if cap(b) < poolSlabSize {
-		return // don't pool undersized slabs
+		return
 	}
 	b = b[:poolSlabSize]
 	bondBufPool.Put(&b)
@@ -105,41 +100,35 @@ func putPoolBuf(b []byte) {
 
 // ── Lane ───────────────────────────────────────────────────────────────────────
 
-// lane wraps one rtpconn.Conn with per-lane health tracking for WRR.
 type lane struct {
 	conn  *rtpconn.Conn
 	label string
 
-	// Weight used by the Interleaved WRR selector (updated every 500ms).
-	// Range [10, 10000] — higher means more packets allocated.
-	weight atomic.Int32
-
-	// Receive-side packet counter used by the health sampler.
-	recvPkts atomic.Int64
-	prevRecv  int64
-
-	// Smooth RTT estimate in milliseconds (updated by weightSampler).
-	// Initialised to a reasonable default; replaced by real measurement once
-	// the lane has been active for at least one sample window.
-	smoothRTT atomic.Int64 // milliseconds, default 50
+	weight    atomic.Int32 // WRR weight [10..10000], higher = more packets
+	recvPkts  atomic.Int64 // total packets received from far-end via this lane
+	prevRecv  int64        // recvPkts value at the previous weight-sample tick
+	smoothRTT atomic.Int64 // EWMA RTT estimate in milliseconds
 }
 
 // ── BondedPacketConn ───────────────────────────────────────────────────────────
 
-// BondedPacketConn is a virtual net.PacketConn that stripes QUIC datagrams
-// across all registered lanes simultaneously.
 type BondedPacketConn struct {
 	mu    sync.RWMutex
 	lanes []*lane
 
-	// Packet sequencing — monotonically increasing, wraps at 65536.
+	// Global packet sequence counter.
 	seqID atomic.Uint32
 
-	// FEC encode state (mutex-protected; called from WriteTo goroutine).
+	// Explicit FEC group ID counter (wraps at 256, matching the uint8 wire field).
+	// Using a dedicated counter means non-FEC packets never consume group IDs,
+	// so group boundaries are never disrupted by hedged or direct packets.
+	fecGroupID atomic.Uint32
+
+	// FEC accumulation state (protected by fecMu).
 	fecMu    sync.Mutex
 	fecEnc   reedsolomon.Encoder
-	fecBuf   [fecDataShards][]byte // accumulation cache (hold, don't send yet)
-	fecCount int                   // how many data pkts accumulated so far
+	fecBuf   [fecDataShards][]byte
+	fecCount int
 
 	// Receive path.
 	recvBuf *reorderBuffer
@@ -148,18 +137,17 @@ type BondedPacketConn struct {
 
 	// Interleaved WRR state (protected by wrrMu).
 	wrrMu        sync.Mutex
-	wrrCurLane   int   // current lane index in the WRR pass
-	wrrCurWeight int32 // current weight threshold in the WRR pass
-	wrrMaxWeight int32 // max lane weight (recomputed on weight change)
-	wrrGCD       int32 // GCD of all lane weights
+	wrrCurLane   int
+	wrrCurWeight int32
+	wrrMaxWeight int32
+	wrrGCD       int32
 
-	// Local/remote fake addresses (QUIC requires net.Addr).
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
 
-// NewBondedPacketConn creates a BondedPacketConn with no lanes.
-// Lanes are added later via AddLane() as WebRTC connections establish.
+// NewBondedPacketConn creates an empty BondedPacketConn.
+// Lanes are added later via AddLane() as WebRTC channels establish.
 func NewBondedPacketConn() (*BondedPacketConn, error) {
 	enc, err := reedsolomon.New(fecDataShards, fecParityShards)
 	if err != nil {
@@ -169,19 +157,19 @@ func NewBondedPacketConn() (*BondedPacketConn, error) {
 		fecEnc:     enc,
 		recvBuf:    newReorderBuffer(),
 		done:       make(chan struct{}),
-		localAddr:  opusAddr{"bond://local:0"},
-		remoteAddr: opusAddr{"bond://remote:0"},
+		localAddr:  opusAddr{name: "bond://local:0"},
+		remoteAddr: opusAddr{name: "bond://remote:0"},
 	}
 	go bc.weightSampler()
 	return bc, nil
 }
 
-// AddLane adds a new rtpconn.Conn as an active bonding lane.
-// Safe to call concurrently, even after QUIC has already started.
+// AddLane registers a new rtpconn.Conn as a bonding lane.
+// Safe to call while QUIC is already running (lanes hot-join the bond).
 func (bc *BondedPacketConn) AddLane(conn *rtpconn.Conn, label string) {
 	l := &lane{conn: conn, label: label}
-	l.weight.Store(100)    // start with healthy weight
-	l.smoothRTT.Store(50)  // 50ms default until measured
+	l.weight.Store(100)
+	l.smoothRTT.Store(50)
 
 	bc.mu.Lock()
 	bc.lanes = append(bc.lanes, l)
@@ -189,13 +177,11 @@ func (bc *BondedPacketConn) AddLane(conn *rtpconn.Conn, label string) {
 	bc.mu.Unlock()
 
 	bc.recomputeWRR()
-	bondLog.Info("[Bond] Lane added: %s (total lanes: %d)", label, n)
-
-	// Each lane gets a dedicated reader goroutine.
+	bondLog.Info("[Bond] Lane added: %s (total: %d)", label, n)
 	go bc.laneReader(l)
 }
 
-// RemoveLane removes a lane (called when a WebRTC channel dies).
+// RemoveLane unregisters a lane when its WebRTC channel dies.
 func (bc *BondedPacketConn) RemoveLane(conn *rtpconn.Conn) {
 	bc.mu.Lock()
 	for i, l := range bc.lanes {
@@ -209,7 +195,7 @@ func (bc *BondedPacketConn) RemoveLane(conn *rtpconn.Conn) {
 	bc.recomputeWRR()
 }
 
-// LaneCount returns the current number of active lanes.
+// LaneCount returns the number of active lanes.
 func (bc *BondedPacketConn) LaneCount() int {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
@@ -219,9 +205,9 @@ func (bc *BondedPacketConn) LaneCount() int {
 // ── net.PacketConn interface ───────────────────────────────────────────────────
 
 // WriteTo is called by quic-go for every outgoing QUIC datagram.
-// Routing decision (in priority order):
-//  1. QUIC long-header (handshake) → speculative hedge to 3 lanes
-//  2. Multi-lane available         → 4+1 FEC group pipeline
+// Priority:
+//  1. QUIC long-header (handshake) → speculative hedge across top-3 lanes
+//  2. ≥2 lanes available           → 4+1 FEC group pipeline
 //  3. Single lane                  → direct send with bond header
 func (bc *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	select {
@@ -238,35 +224,26 @@ func (bc *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		return 0, fmt.Errorf("no active lanes")
 	}
 
-	// ── 1. Speculative hedging for QUIC Initial/Handshake packets ─────────
-	// QUIC long-header packets have MSB of byte 0 set (0x80+).
-	// These are the critical handshake frames — hedge across 3 lanes to
-	// race for the fastest path and cut connection setup latency by ~50%.
+	// QUIC long-header (MSB set) → hedge to maximise handshake reliability.
 	if len(p) > 0 && len(p) <= 1280 && (p[0]&0x80) != 0 && numLanes >= 3 {
 		bc.sendHedged(p)
 		return len(p), nil
 	}
 
-	// ── 2. FEC group pipeline (zero-duplicate) ────────────────────────────
 	if numLanes >= fecMinLanes {
 		return bc.writeWithFEC(p)
 	}
-
-	// ── 3. Single-lane direct send ────────────────────────────────────────
 	return bc.writeDirect(p, 0)
 }
 
-// ReadFrom blocks until a reordered+FEC-recovered packet is ready.
-// Returns the slab to the pool after QUIC consumes it.
-// Implements net.PacketConn.
+// ReadFrom blocks until the next sequential packet is ready.
+// Returns the pool slab to the pool after QUIC copies the bytes out.
 func (bc *BondedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	data := bc.recvBuf.Next()
 	if data == nil {
 		return 0, nil, fmt.Errorf("bonded conn closed")
 	}
 	n = copy(p, data)
-	// Return the slab to the pool if it came from the pool.
-	// The copy above has already moved the bytes into QUIC's buffer.
 	putPoolBuf(data)
 	return n, bc.remoteAddr, nil
 }
@@ -284,60 +261,53 @@ func (bc *BondedPacketConn) SetDeadline(_ time.Time) error      { return nil }
 func (bc *BondedPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (bc *BondedPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 
-// ── FEC write pipeline (FIXED — zero-duplicate) ────────────────────────────────
-//
-// HOLE 1 & 2 FIX:
-//   The old code called writeDirect() immediately for packets 0-2, then
-//   re-transmitted them again when the group flushed — 60% duplicate overhead.
-//
-//   New design: packets 0-2 are HELD in fecBuf only. Nothing is sent to the
-//   network until the 4th packet arrives and the complete 4+1 group is encoded.
-//   All 5 shards are emitted exactly once with monotonically increasing seq IDs.
-//   QUIC never sees a duplicate datagram.
+// ── FEC write pipeline ─────────────────────────────────────────────────────────
+
+// writeWithFEC accumulates packets silently into a 4-shard group, then encodes
+// and emits all 5 shards exactly once. No packet is sent twice.
 func (bc *BondedPacketConn) writeWithFEC(p []byte) (int, error) {
 	bc.fecMu.Lock()
 	defer bc.fecMu.Unlock()
 
-	// Clamp to MTU.
 	data := p
 	if len(data) > maxBondPayload {
 		data = data[:maxBondPayload]
 	}
 
-	// ── Copy into the accumulation buffer (do NOT send yet) ───────────────
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	bc.fecBuf[bc.fecCount] = buf
 	bc.fecCount++
 
-	// Group not yet complete — hold and return.
-	// QUIC is not starved: it issues WriteTo calls at its own pacing rate;
-	// the group accumulates within microseconds at line rate.
+	// Hold until group is complete — nothing is sent to the network yet.
 	if bc.fecCount < fecDataShards {
 		return len(p), nil
 	}
 
-	// ── Group complete — encode parity, flush all 5 shards exactly once ───
 	return bc.flushFECGroup(len(p))
 }
 
-// flushFECGroup encodes the accumulated 4 shards into a 4+1 RS group and
-// emits all 5 frames to the network with consecutive sequence IDs.
-// Called with bc.fecMu held.
+// flushFECGroup encodes the 4 buffered shards into a 4+1 RS group and emits
+// all 5 shards through the WRR selector.
+//
+// Hole 1 fix: pickLane() is called for EVERY shard — no more i%len(lanes).
+// Hole 3 fix: every shard carries the explicit grpID binding the group together.
 func (bc *BondedPacketConn) flushFECGroup(origLen int) (int, error) {
+	// Atomically allocate a group ID for this group (wraps at 256).
+	grpID := uint8(bc.fecGroupID.Add(1) & 0xFF)
+
 	defer func() {
 		bc.fecBuf = [fecDataShards][]byte{}
 		bc.fecCount = 0
 	}()
 
-	// Pad all data shards to equal length (RS requirement).
+	// Pad all shards to equal length (Reed-Solomon requirement).
 	maxLen := 0
 	for _, s := range bc.fecBuf {
 		if len(s) > maxLen {
 			maxLen = len(s)
 		}
 	}
-
 	shards := make([][]byte, fecTotalShards)
 	for i := 0; i < fecDataShards; i++ {
 		shard := make([]byte, maxLen)
@@ -347,8 +317,8 @@ func (bc *BondedPacketConn) flushFECGroup(origLen int) (int, error) {
 	shards[fecDataShards] = make([]byte, maxLen)
 
 	if err := bc.fecEnc.Encode(shards); err != nil {
-		// Fallback: send each accumulated data packet once directly.
-		bondLog.Warn("[Bond] FEC encode error: %v — sending data shards directly", err)
+		// Fallback: send buffered data shards individually via WRR.
+		bondLog.Warn("[Bond] FEC encode error: %v — falling back to raw send", err)
 		for i := 0; i < fecDataShards; i++ {
 			if bc.fecBuf[i] != nil {
 				bc.writeDirect(bc.fecBuf[i], flagFECData)
@@ -357,25 +327,26 @@ func (bc *BondedPacketConn) flushFECGroup(origLen int) (int, error) {
 		return origLen, nil
 	}
 
-	// Emit all 5 shards sequentially across different lanes.
-	// Each shard gets its own monotonic seq ID — no duplicates.
 	bc.mu.RLock()
 	lanes := bc.lanes
 	bc.mu.RUnlock()
 
+	// Emit all 5 shards — each through the WRR engine, not a static modulo.
+	// Hole 1 fix: this loop now calls pickLane() for every shard.
 	for i, shard := range shards {
-		flags := uint8(flagFECData)
+		flags := flagFECData
 		if i == fecDataShards {
 			flags = flagParity
 		}
-		laneIdx := i % len(lanes) // spread across lanes: 0→lane0, 1→lane1, ...
-		bc.writeToLane(shard, laneIdx, flags)
+		laneIdx := bc.pickLane(lanes) // ← WRR, not i%len(lanes)
+		bc.writeToLane(shard, laneIdx, flags, grpID, uint8(i))
 	}
 
 	return origLen, nil
 }
 
-// writeDirect sends one packet to the next WRR-selected lane.
+// writeDirect sends one packet via WRR with no FEC grouping.
+// grpID = 0xFF, shardIdx = 0xFF (sentinel: not part of a group).
 func (bc *BondedPacketConn) writeDirect(p []byte, flags uint8) (int, error) {
 	bc.mu.RLock()
 	lanes := bc.lanes
@@ -384,14 +355,12 @@ func (bc *BondedPacketConn) writeDirect(p []byte, flags uint8) (int, error) {
 	if len(lanes) == 0 {
 		return 0, fmt.Errorf("no lanes")
 	}
-
 	laneIdx := bc.pickLane(lanes)
-	bc.writeToLane(p, laneIdx, flags)
+	bc.writeToLane(p, laneIdx, flags, grpIDNone, shardIdxNone)
 	return len(p), nil
 }
 
-// sendHedged duplicates p to `count` lanes simultaneously.
-// Used for QUIC handshake packets to guarantee the fastest path wins.
+// sendHedged duplicates a critical packet to the top-N highest-weight lanes.
 func (bc *BondedPacketConn) sendHedged(p []byte) {
 	bc.mu.RLock()
 	lanes := bc.lanes
@@ -401,16 +370,13 @@ func (bc *BondedPacketConn) sendHedged(p []byte) {
 	if len(lanes) < count {
 		count = len(lanes)
 	}
-
-	// Pick the top-weight lanes for hedging (not just sequential).
-	picked := bc.topNLanes(lanes, count)
-	for _, idx := range picked {
-		bc.writeToLane(p, idx, flagHedged)
+	for _, idx := range bc.topNLanes(lanes, count) {
+		bc.writeToLane(p, idx, flagHedged, grpIDNone, shardIdxNone)
 	}
-	bondLog.Info("[Bond] Hedged packet across %d lanes (size=%d)", count, len(p))
+	bondLog.Info("[Bond] Hedged packet to %d lanes (size=%d)", count, len(p))
 }
 
-// topNLanes returns indices of the N highest-weight lanes.
+// topNLanes returns the indices of the N highest-weight lanes.
 func (bc *BondedPacketConn) topNLanes(lanes []*lane, n int) []int {
 	type entry struct {
 		idx    int
@@ -420,7 +386,6 @@ func (bc *BondedPacketConn) topNLanes(lanes []*lane, n int) []int {
 	for i, l := range lanes {
 		es[i] = entry{i, l.weight.Load()}
 	}
-	// Partial sort: move top-n to the front.
 	for i := 0; i < n && i < len(es); i++ {
 		best := i
 		for j := i + 1; j < len(es); j++ {
@@ -437,9 +402,9 @@ func (bc *BondedPacketConn) topNLanes(lanes []*lane, n int) []int {
 	return out
 }
 
-// writeToLane prepends the bond header and writes one frame to a specific lane.
-// Uses the pool buffer for the header+payload assembly (Phase 5 zero-copy).
-func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags uint8) {
+// writeToLane prepends the 5-byte bond header and writes one frame to a lane.
+// Uses pool slabs for the framing buffer to avoid heap allocation.
+func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags, grpID, shardIdx uint8) {
 	bc.mu.RLock()
 	if laneIdx >= len(bc.lanes) {
 		bc.mu.RUnlock()
@@ -449,9 +414,8 @@ func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags uint8) {
 	bc.mu.RUnlock()
 
 	seq := uint16(bc.seqID.Add(1) - 1)
-
-	// Lease a slab, build the frame, write, then reclaim the slab.
 	total := bondHeaderSize + len(p)
+
 	var frame []byte
 	if total <= poolSlabSize {
 		slab := getPoolBuf()
@@ -461,9 +425,11 @@ func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags uint8) {
 		frame = make([]byte, total)
 	}
 
+	// 5-byte wire header: [seq:2][flags:1][grpID:1][shardIdx:1]
 	binary.BigEndian.PutUint16(frame[0:2], seq)
-	frame[2] = uint8(laneIdx)
-	frame[3] = flags
+	frame[2] = flags
+	frame[3] = grpID
+	frame[4] = shardIdx
 	copy(frame[bondHeaderSize:], p)
 
 	if _, err := l.conn.WriteFrame(frame); err != nil {
@@ -471,21 +437,11 @@ func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags uint8) {
 	}
 }
 
-// ── Interleaved Weighted Round-Robin selector (FIXED) ─────────────────────────
-//
-// HOLE 3 FIX:
-//   The old code used a plain modulo (all lanes equally), so a single slow
-//   lane dragged down the entire bond. The new Interleaved WRR algorithm
-//   (Katevenis et al.) assigns packet slots proportionally to weight:
-//   a lane with weight 200 gets twice the packets of a lane with weight 100.
-//
-// Algorithm state: (wrrCurLane, wrrCurWeight)
-//   - Start: curLane=0, curWeight=maxWeight
-//   - Each call: advance curLane; if curLane wraps, decrease curWeight by GCD.
-//   - A lane is selected if its weight >= curWeight; otherwise skip.
-//   - When curWeight reaches 0, reset to maxWeight.
+// ── Interleaved WRR selector ───────────────────────────────────────────────────
 
-// pickLane returns the index of the next lane to use for a packet.
+// pickLane returns the next lane index using Interleaved WRR.
+// A lane with weight 400 gets exactly 4× the packets of a lane with weight 100.
+// A lane whose weight falls below the current threshold is skipped entirely.
 func (bc *BondedPacketConn) pickLane(lanes []*lane) int {
 	if len(lanes) == 1 {
 		return 0
@@ -496,18 +452,19 @@ func (bc *BondedPacketConn) pickLane(lanes []*lane) int {
 
 	n := len(lanes)
 	maxW := bc.wrrMaxWeight
-	gcd := bc.wrrGCD
-	if maxW == 0 || gcd == 0 {
-		// Fallback: plain round-robin (happens before first weight sample).
+	g := bc.wrrGCD
+	if maxW == 0 || g == 0 {
+		// Pre-sample fallback: plain round-robin.
 		bc.wrrCurLane = (bc.wrrCurLane + 1) % n
 		return bc.wrrCurLane
 	}
 
-	// Interleaved WRR scan.
+	// Interleaved WRR scan (terminates because at least one lane has
+	// weight == maxW which is always ≥ any curWeight).
 	for {
 		bc.wrrCurLane = (bc.wrrCurLane + 1) % n
 		if bc.wrrCurLane == 0 {
-			bc.wrrCurWeight -= gcd
+			bc.wrrCurWeight -= g
 			if bc.wrrCurWeight <= 0 {
 				bc.wrrCurWeight = maxW
 			}
@@ -518,7 +475,7 @@ func (bc *BondedPacketConn) pickLane(lanes []*lane) int {
 	}
 }
 
-// recomputeWRR recalculates maxWeight and GCD after any lane change.
+// recomputeWRR recalculates maxWeight and GCD after any weight change.
 func (bc *BondedPacketConn) recomputeWRR() {
 	bc.mu.RLock()
 	lanes := bc.lanes
@@ -528,8 +485,7 @@ func (bc *BondedPacketConn) recomputeWRR() {
 		return
 	}
 
-	var maxW int32
-	var g int32
+	var maxW, g int32
 	for _, l := range lanes {
 		w := l.weight.Load()
 		if w > maxW {
@@ -538,7 +494,7 @@ func (bc *BondedPacketConn) recomputeWRR() {
 		if g == 0 {
 			g = w
 		} else {
-			g = gcd(g, w)
+			g = gcd32(g, w)
 		}
 	}
 
@@ -550,27 +506,24 @@ func (bc *BondedPacketConn) recomputeWRR() {
 	bc.wrrMu.Unlock()
 }
 
-func gcd(a, b int32) int32 {
+func gcd32(a, b int32) int32 {
 	for b != 0 {
 		a, b = b, a%b
 	}
 	return a
 }
 
-// ── Weight sampler (health-based, RTT-aware) ───────────────────────────────────
+// ── Weight sampler ─────────────────────────────────────────────────────────────
 
 // weightSampler recomputes per-lane weights every 500ms using:
 //
 //	Weight_i = max(10, 10000 / (SmoothRTT_i × (LossRate_i + 1)))
 //
-// SmoothRTT is estimated from the inter-arrival rate of receive packets:
-// a lane that receives more packets in the window is assumed to have lower RTT.
-// LossRate is approximated as the fraction of expected packets that didn't arrive.
+// RTT and loss are estimated from the receive-packet-rate observed on each lane.
 func (bc *BondedPacketConn) weightSampler() {
 	ticker := time.NewTicker(weightSampleInterval)
 	defer ticker.Stop()
 
-	changed := false
 	for {
 		select {
 		case <-bc.done:
@@ -580,51 +533,42 @@ func (bc *BondedPacketConn) weightSampler() {
 			lanes := bc.lanes
 			bc.mu.RUnlock()
 
-			changed = false
+			changed := false
 			for _, l := range lanes {
 				cur := l.recvPkts.Load()
 				delta := cur - l.prevRecv
 				l.prevRecv = cur
 
-				// Estimate RTT: more packets received → lower RTT (proxy).
-				// Map delta ∈ [0, ∞) → RTT ∈ [5ms, 1000ms].
+				// Map receive rate to RTT proxy (higher rate → lower RTT).
 				var rttMs int64
-				if delta >= 50 {
-					rttMs = 5 // very active lane
-				} else if delta > 0 {
+				switch {
+				case delta >= 50:
+					rttMs = 5
+				case delta > 0:
 					rttMs = 5 + int64(math.Round(float64(50-delta)/50.0*995))
-				} else {
-					rttMs = 1000 // silent lane — high penalty
+				default:
+					rttMs = 1000 // silent lane — severe penalty
 				}
 
-				// Smooth the RTT estimate (EWMA, α = 0.3).
+				// EWMA smoothing (α=0.3).
 				prev := l.smoothRTT.Load()
 				smoothed := int64(math.Round(float64(prev)*0.7 + float64(rttMs)*0.3))
 				l.smoothRTT.Store(smoothed)
 
-				// Weight formula: max(10, 10000 / (rtt * (loss+1)))
-				// LossRate proxy: if rttMs == 1000 (silent), treat as 50% loss.
 				lossRate := 0.0
 				if rttMs == 1000 {
 					lossRate = 0.5
 				}
 				denom := float64(smoothed) * (lossRate + 1.0)
 				newW := int32(math.Round(10000.0 / denom))
-				if newW < 10 {
-					newW = 10
-				}
-				if newW > 10000 {
-					newW = 10000
-				}
+				newW = max32(10, min32(10000, newW))
 
 				old := l.weight.Swap(newW)
 				if old != newW {
 					changed = true
-					bondLog.Info("[Bond] Lane %s weight: %d→%d (rtt≈%dms)",
-						l.label, old, newW, smoothed)
+					bondLog.Info("[Bond] Lane %s weight %d→%d (rtt≈%dms)", l.label, old, newW, smoothed)
 				}
 			}
-
 			if changed {
 				bc.recomputeWRR()
 			}
@@ -632,14 +576,30 @@ func (bc *BondedPacketConn) weightSampler() {
 	}
 }
 
+func max32(a, b int32) int32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min32(a, b int32) int32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ── Lane reader goroutine ──────────────────────────────────────────────────────
 
-// laneReader continuously reads from one rtpconn.Conn, strips the bond
-// header, and feeds payloads into the reorder buffer or FEC reconstructor.
-// Uses pool slabs for the receive buffer (Phase 5).
+// laneReader continuously reads from one rtpconn.Conn, strips the 5-byte bond
+// header, and routes payloads to the reorder buffer or FEC reconstructor.
+//
+// Hole 2+3 fix: FEC groups are keyed by explicit grpID (uint8), not by seq.
+// Out-of-order arrival no longer confuses group membership.
 func (bc *BondedPacketConn) laneReader(l *lane) {
-	// Per-lane FEC group map: tracks incoming 4+1 groups for reconstruction.
-	fecGroups := make(map[uint16]*fecGroup)
+	// Per-lane FEC group map keyed by the explicit wire GroupID.
+	fecGroups := make(map[uint8]*fecGroup)
 
 	for {
 		select {
@@ -658,7 +618,6 @@ func (bc *BondedPacketConn) laneReader(l *lane) {
 				return
 			}
 		}
-
 		l.recvPkts.Add(1)
 
 		if len(raw) < bondHeaderSize {
@@ -666,125 +625,139 @@ func (bc *BondedPacketConn) laneReader(l *lane) {
 			continue
 		}
 
-		// Parse bond header.
-		seq := binary.BigEndian.Uint16(raw[0:2])
-		flags := raw[3]
-		payload := raw[bondHeaderSize:]
+		// Unpack 5-byte header.
+		seq      := binary.BigEndian.Uint16(raw[0:2])
+		flags    := raw[2]
+		grpID    := raw[3]
+		shardIdx := raw[4]
+		payload  := raw[bondHeaderSize:]
 
-		isHedged  := (flags & flagHedged) != 0
-		isParity  := (flags & flagParity) != 0
-		isFECData := (flags & flagFECData) != 0
-
-		// Copy payload into a pool slab so the RTP receive buffer can be reused.
+		// Copy payload into a pool slab so the RTP receive buffer is immediately freed.
 		slab := getPoolBuf()
 		slab = slab[:len(payload)]
 		copy(slab, payload)
 		payload = slab
 
+		isParity  := (flags & flagParity) != 0
+		isHedged  := (flags & flagHedged) != 0
+		isFECData := (flags & flagFECData) != 0
+
 		switch {
 		case isParity:
-			// Deliver parity shard to FEC reconstructor.
-			bc.deliverToFEC(fecGroups, seq, payload, true)
+			// Parity shard: deliver to FEC reconstructor (not to reorder buffer).
+			bc.deliverParityShard(fecGroups, grpID, seq, payload)
 
 		case isHedged:
-			// Reorder buffer deduplicates via bitmask — insert and let it decide.
+			// Hedged duplicate: the reorder buffer's bitmask deduplicates.
 			bc.recvBuf.Insert(seq, payload, true)
 
 		case isFECData:
-			// Data shard belonging to a FEC group — track for reconstruction.
-			bc.trackFECDataShard(fecGroups, seq, payload)
+			// Data shard from a 4+1 group: track and reconstruct on arrival.
+			bc.trackFECDataShard(fecGroups, grpID, shardIdx, seq, payload)
 
 		default:
-			// Standalone data packet (single-lane mode or non-FEC path).
+			// Standalone direct packet: insert normally.
 			bc.recvBuf.Insert(seq, payload, false)
 		}
+
+		bc.cleanStaleGroups(fecGroups)
 	}
 }
 
-// ── FEC receive-side tracking ──────────────────────────────────────────────────
+// ── FEC receive-side state ─────────────────────────────────────────────────────
 
-// fecGroup tracks the shards of one 4+1 FEC group on the receive side.
+// fecGroup tracks one 4+1 Reed-Solomon group on the receive side.
+// Keyed by the explicit grpID from the wire header.
 type fecGroup struct {
-	baseSeq  uint16
-	shards   [fecTotalShards][]byte
-	received int
-	maxLen   int
+	groupID   uint8
+	shards    [fecTotalShards][]byte
+	seqNums   [fecTotalShards]uint16 // seq of each shard for delivery ordering
+	received  int
+	maxLen    int
+	createdAt time.Time
 }
 
-func (fg *fecGroup) addShard(idx int, data []byte) {
+func (fg *fecGroup) addShard(idx int, seq uint16, data []byte) bool {
 	if idx < 0 || idx >= fecTotalShards {
-		return
+		return false
 	}
-	if fg.shards[idx] == nil {
-		fg.shards[idx] = data
-		fg.received++
-		if len(data) > fg.maxLen {
-			fg.maxLen = len(data)
-		}
+	if fg.shards[idx] != nil {
+		return false // duplicate shard in the same group
 	}
+	fg.shards[idx] = data
+	fg.seqNums[idx] = seq
+	fg.received++
+	if len(data) > fg.maxLen {
+		fg.maxLen = len(data)
+	}
+	return true
 }
 
 func (fg *fecGroup) canReconstruct() bool {
 	return fg.received >= fecDataShards
 }
 
-// trackFECDataShard adds a data shard to its group and delivers when complete.
-// FEC group base is derived from the sequence position within the group.
-// The emitting side assigns shards sequentially: baseSeq, baseSeq+1, ... baseSeq+3.
-func (bc *BondedPacketConn) trackFECDataShard(groups map[uint16]*fecGroup, seq uint16, payload []byte) {
-	// Find or create the group for this shard.
-	// Since shards are emitted in order, search the last few open groups.
-	var fg *fecGroup
-	for base, g := range groups {
-		diff := int(seq) - int(base)
-		if diff >= 0 && diff < fecDataShards {
-			fg = g
-			break
-		}
-	}
-	if fg == nil {
-		// New group starting at this seq (seq is baseSeq+0).
-		// We look back up to fecDataShards-1 to find the real base.
-		// For simplicity, treat seq itself as the base.
-		fg = &fecGroup{baseSeq: seq}
-		groups[seq] = fg
+// trackFECDataShard processes an incoming FEC data shard.
+//
+// Hole 2 fix: group membership is now determined by the explicit grpID field,
+// not by computing baseSeq = seq - (seq % N). Out-of-order arrivals (e.g.,
+// shard 2 arrives before shard 0) always map to the correct group.
+//
+// Data shards are also forwarded directly to the reorder buffer so QUIC is
+// not starved while the group is still accumulating.
+func (bc *BondedPacketConn) trackFECDataShard(groups map[uint8]*fecGroup, grpID, shardIdx uint8, seq uint16, payload []byte) {
+	if shardIdx >= fecDataShards {
+		// Invalid shard index — drop.
+		putPoolBuf(payload)
+		return
 	}
 
-	idx := int(seq - fg.baseSeq)
-	fg.addShard(idx, payload)
-
-	if fg.canReconstruct() {
-		bc.reconstructAndDeliver(fg)
-		bc.cleanFECGroups(groups, fg.baseSeq)
-	} else {
-		// Deliver data shards directly as they arrive — the reorder buffer
-		// will handle sequencing. If the parity shard later enables
-		// reconstruction of a missing one, it will be inserted there too.
-		bc.recvBuf.Insert(seq, payload, false)
+	fg, exists := groups[grpID]
+	if !exists {
+		fg = &fecGroup{groupID: grpID, createdAt: time.Now()}
+		groups[grpID] = fg
 	}
-}
 
-// deliverToFEC handles an incoming parity shard.
-func (bc *BondedPacketConn) deliverToFEC(groups map[uint16]*fecGroup, seq uint16, payload []byte, isParity bool) {
-	// Parity seq = baseSeq + fecDataShards (the 5th shard, index 4).
-	// So baseSeq = seq - fecDataShards.
-	baseSeq := seq - fecDataShards
-	fg, ok := groups[baseSeq]
-	if !ok {
-		fg = &fecGroup{baseSeq: baseSeq}
-		groups[baseSeq] = fg
-	}
-	fg.addShard(fecDataShards, payload) // parity is always shard index 4
+	fg.addShard(int(shardIdx), seq, payload)
+
+	// Always deliver the data shard to the reorder buffer immediately.
+	// If it gets reconstructed later, the bitmask dedup prevents double delivery.
+	bc.recvBuf.Insert(seq, payload, false)
 
 	if fg.canReconstruct() {
 		bc.reconstructAndDeliver(fg)
-		bc.cleanFECGroups(groups, baseSeq)
+		delete(groups, grpID)
 	}
 }
 
-// reconstructAndDeliver uses Reed-Solomon to fill any missing data shards and
-// inserts all recovered payloads into the reorder buffer.
+// deliverParityShard processes an incoming FEC parity shard.
+// The parity shard is used for reconstruction only — it is not forwarded to QUIC.
+func (bc *BondedPacketConn) deliverParityShard(groups map[uint8]*fecGroup, grpID uint8, seq uint16, payload []byte) {
+	fg, exists := groups[grpID]
+	if !exists {
+		fg = &fecGroup{groupID: grpID, createdAt: time.Now()}
+		groups[grpID] = fg
+	}
+
+	fg.addShard(fecDataShards, seq, payload)
+
+	if fg.canReconstruct() {
+		bc.reconstructAndDeliver(fg)
+		delete(groups, grpID)
+	}
+}
+
+// reconstructAndDeliver uses Reed-Solomon to recover any missing data shards
+// and inserts ONLY the recovered (previously missing) shards into the reorder
+// buffer. Shards that were already delivered are not re-inserted.
 func (bc *BondedPacketConn) reconstructAndDeliver(fg *fecGroup) {
+	// Record which data shards were absent before reconstruction.
+	missing := [fecDataShards]bool{}
+	for i := 0; i < fecDataShards; i++ {
+		missing[i] = fg.shards[i] == nil
+	}
+
+	// Pad all present shards to equal length.
 	shards := make([][]byte, fecTotalShards)
 	for i := 0; i < fecTotalShards; i++ {
 		if fg.shards[i] != nil {
@@ -795,35 +768,51 @@ func (bc *BondedPacketConn) reconstructAndDeliver(fg *fecGroup) {
 	}
 
 	if err := bc.fecEnc.ReconstructData(shards); err != nil {
-		bondLog.Warn("[Bond] FEC reconstruct failed: %v", err)
-	} else {
-		bondLog.Info("[Bond] ✅ FEC reconstructed missing shard (group base=%d)", fg.baseSeq)
+		bondLog.Warn("[Bond] FEC reconstruct failed (grp=%d): %v", fg.groupID, err)
+		return
 	}
 
-	// Deliver all data shards (both original and reconstructed).
+	// Recover the seq numbers of missing shards by extrapolating from neighbours.
+	// Because the sender assigns seq IDs in shard order (0,1,2,3), the deltas
+	// between adjacent present shards tell us the missing ones.
+	var baseSeq uint16
+	baseFound := false
 	for i := 0; i < fecDataShards; i++ {
-		if shards[i] != nil {
-			bc.recvBuf.Insert(fg.baseSeq+uint16(i), shards[i], false)
+		if fg.shards[i] != nil {
+			// Work backwards: seq[i] − i gives the theoretical seq[0].
+			baseSeq = fg.seqNums[i] - uint16(i)
+			baseFound = true
+			break
+		}
+	}
+	if !baseFound {
+		return
+	}
+
+	// Insert only the shards that were genuinely missing.
+	for i := 0; i < fecDataShards; i++ {
+		if missing[i] && shards[i] != nil {
+			targetSeq := baseSeq + uint16(i)
+			bondLog.Info("[Bond] ✅ FEC recovered missing shard seq=%d (grp=%d)", targetSeq, fg.groupID)
+			bc.recvBuf.Insert(targetSeq, shards[i], false)
 		}
 	}
 }
 
-// cleanFECGroups removes groups that are too old to be relevant.
-func (bc *BondedPacketConn) cleanFECGroups(groups map[uint16]*fecGroup, delivered uint16) {
-	for base := range groups {
-		diff := int(delivered) - int(base)
-		if diff < 0 {
-			diff += maxSeqID
-		}
-		if diff > reorderWindowSize*2 {
-			delete(groups, base)
+// cleanStaleGroups evicts FEC groups that have been open too long.
+// This prevents memory accumulation when packets are permanently lost.
+func (bc *BondedPacketConn) cleanStaleGroups(groups map[uint8]*fecGroup) {
+	now := time.Now()
+	for id, g := range groups {
+		if now.Sub(g.createdAt) > 2*time.Second {
+			delete(groups, id)
 		}
 	}
 }
 
 // ── Factory helpers ────────────────────────────────────────────────────────────
 
-// NewBondedClient creates a BondedPacketConn pre-loaded with lanes.
+// NewBondedClient creates a BondedPacketConn pre-loaded with the given lanes.
 func NewBondedClient(lanes []*rtpconn.Conn, labels []string) (*BondedPacketConn, error) {
 	bc, err := NewBondedPacketConn()
 	if err != nil {
@@ -844,10 +833,8 @@ func NewBondedServer(lanes []*rtpconn.Conn, labels []string) (*BondedPacketConn,
 	return NewBondedClient(lanes, labels)
 }
 
-// BondedRemoteAddr returns the fake remote address for quic.Dial().
-func BondedRemoteAddr() net.Addr { return opusAddr{"bond://remote:0"} }
+// BondedRemoteAddr returns the fake remote address required by quic.Dial().
+func BondedRemoteAddr() net.Addr { return opusAddr{name: "bond://remote:0"} }
 
-// ── atomic helpers ─────────────────────────────────────────────────────────────
-
-// Ensure atomic.Int32 satisfies the interface we use throughout.
+// ── Ensure atomic.Int32 Load method satisfies the usage pattern ───────────────
 var _ interface{ Load() int32 } = (*atomic.Int32)(nil)

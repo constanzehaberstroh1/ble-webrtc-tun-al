@@ -728,6 +728,8 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		InitialConnectionReceiveWindow:  8 * 1024 * 1024,   // 8MB (was 4MB)
 		MaxConnectionReceiveWindow:      64 * 1024 * 1024,  // 64MB (was 16MB) — 5-lane aggregate
 		DisablePathMTUDiscovery:         true,
+		// EnableDatagrams enables RFC 9221 QUIC datagrams (must match client).
+		EnableDatagrams:                 true,
 	}
 
 	// ── Bonded mode: register this lane with the BondRegistry ───────────────────
