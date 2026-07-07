@@ -60,6 +60,11 @@ const (
 	fecMinLanes          = 2
 	weightSampleInterval = 500 * time.Millisecond
 
+	// fecFlushInterval bounds how long a partially-accumulated FEC group is
+	// held before being flushed as direct packets. Must be small enough that
+	// sparse QUIC traffic (ACKs, keepalives) is never stalled.
+	fecFlushInterval = 2 * time.Millisecond
+
 	maxBondPayload = 1135                               // 1140 − 5-byte header
 	poolSlabSize   = maxBondPayload + bondHeaderSize + 64 // 1264 bytes per slab
 )
@@ -150,6 +155,7 @@ func NewBondedPacketConn() (*BondedPacketConn, error) {
 		remoteAddr: opusAddr{name: "bond://remote:0"},
 	}
 	go bc.weightSampler()
+	go bc.fecFlushLoop()
 	return bc, nil
 }
 
@@ -259,9 +265,46 @@ func (bc *BondedPacketConn) writeWithFEC(p []byte) (int, error) {
 	bc.fecCount++
 
 	if bc.fecCount < fecDataShards {
-		return len(p), nil // hold — nothing sent yet
+		return len(p), nil // hold — nothing sent yet (flush timer bounds the wait)
 	}
 	return bc.flushFECGroup(len(p))
+}
+
+// fecFlushLoop drains a partially-accumulated FEC group as direct (non-FEC)
+// packets if 4 data shards have not arrived within fecFlushInterval. Without
+// this, sparse traffic (e.g. a lone ACK) would be buffered forever, stalling
+// the QUIC connection. Under bursty traffic the group fills long before the
+// timer fires, so normal FEC encoding is unaffected.
+func (bc *BondedPacketConn) fecFlushLoop() {
+	ticker := time.NewTicker(fecFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-bc.done:
+			return
+		case <-ticker.C:
+			bc.flushPartialFEC()
+		}
+	}
+}
+
+func (bc *BondedPacketConn) flushPartialFEC() {
+	bc.fecMu.Lock()
+	if bc.fecCount == 0 || bc.fecCount >= fecDataShards {
+		bc.fecMu.Unlock()
+		return
+	}
+	pending := make([][]byte, bc.fecCount)
+	copy(pending, bc.fecBuf[:bc.fecCount])
+	bc.fecBuf = [fecDataShards][]byte{}
+	bc.fecCount = 0
+	bc.fecMu.Unlock()
+
+	for _, pkt := range pending {
+		if pkt != nil {
+			bc.writeDirect(pkt, 0)
+		}
+	}
 }
 
 func (bc *BondedPacketConn) flushFECGroup(origLen int) (int, error) {
@@ -307,7 +350,8 @@ func (bc *BondedPacketConn) flushFECGroup(origLen int) (int, error) {
 		}
 		// DRR-based lane selection for every shard.
 		laneIdx := bc.pickLaneDRR(lanes, int32(len(shard)+bondHeaderSize))
-		bc.writeToLane(shard, laneIdx, flags, grpID, uint8(i))
+		seq := uint16(bc.seqID.Add(1) - 1)
+		bc.writeToLane(shard, laneIdx, seq, flags, grpID, uint8(i))
 	}
 	return origLen, nil
 }
@@ -320,7 +364,8 @@ func (bc *BondedPacketConn) writeDirect(p []byte, flags uint8) (int, error) {
 		return 0, fmt.Errorf("no lanes")
 	}
 	laneIdx := bc.pickLaneDRR(lanes, int32(len(p)+bondHeaderSize))
-	bc.writeToLane(p, laneIdx, flags, grpIDNone, shardIdxNone)
+	seq := uint16(bc.seqID.Add(1) - 1)
+	bc.writeToLane(p, laneIdx, seq, flags, grpIDNone, shardIdxNone)
 	return len(p), nil
 }
 
@@ -332,8 +377,11 @@ func (bc *BondedPacketConn) sendHedged(p []byte) {
 	if len(lanes) < count {
 		count = len(lanes)
 	}
+	// All hedged copies share ONE sequence id so the receiver's reorder
+	// buffer deduplicates them (the first copy wins; the rest are dropped).
+	seq := uint16(bc.seqID.Add(1) - 1)
 	for _, idx := range bc.topNLanes(lanes, count) {
-		bc.writeToLane(p, idx, flagHedged, grpIDNone, shardIdxNone)
+		bc.writeToLane(p, idx, seq, flagHedged, grpIDNone, shardIdxNone)
 	}
 	bondLog.Info("[Bond] Hedged packet to %d lanes (size=%d)", count, len(p))
 }
@@ -363,7 +411,7 @@ func (bc *BondedPacketConn) topNLanes(lanes []*lane, n int) []int {
 	return out
 }
 
-func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags, grpID, shardIdx uint8) {
+func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, seq uint16, flags, grpID, shardIdx uint8) {
 	bc.mu.RLock()
 	if laneIdx >= len(bc.lanes) {
 		bc.mu.RUnlock()
@@ -372,7 +420,6 @@ func (bc *BondedPacketConn) writeToLane(p []byte, laneIdx int, flags, grpID, sha
 	l := bc.lanes[laneIdx]
 	bc.mu.RUnlock()
 
-	seq := uint16(bc.seqID.Add(1) - 1)
 	total := bondHeaderSize + len(p)
 
 	var frame []byte

@@ -361,16 +361,25 @@ func (tm *TunnelManager) refreshChannel(
 	// 4. Re-dial with Layer 1+2 retry (ENDCALL on any further call-phase fail).
 	tm.setChannelPhase(idx, PhaseBaleConnect, "")
 	newCh, newQConn := tm.initChannelWithRetry(ctx, idx, tp, label)
-	if newCh == nil || newQConn == nil {
-		// FIX (Hole 1 — Zombie Spin): set PhaseError so the monitor loop in
-		// monitorAndReconnect can detect a fatal failure and exit cleanly
-		// instead of spinning indefinitely with both pointers nil.
+	if newCh == nil {
+		// In bonded mode newQConn is intentionally nil (master QUIC is shared),
+		// so only newCh is required. A nil newCh is a fatal reconnect failure.
 		tm.setChannelPhase(idx, PhaseError, "reconnect yielded no channel — giving up")
 		return
 	}
 
 	tm.setChannelPhase(idx, PhaseTunnelActive, "")
-	tunnelPool.Add(newQConn, label)
+	if tm.bonded {
+		// Re-register the refreshed lane's rtpconn with the shared bond.
+		if newCh.sfu != nil {
+			if rtpC := newCh.sfu.GetRTPConn(); rtpC != nil {
+				tunnelPool.AddLane(rtpC, label)
+				mainLog.Info("[%s] Bonded lane re-registered after refresh", label)
+			}
+		}
+	} else {
+		tunnelPool.Add(newQConn, label)
+	}
 	mu.Lock()
 	*channels = append(*channels, newCh)
 	mu.Unlock()

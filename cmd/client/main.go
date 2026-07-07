@@ -252,6 +252,10 @@ type TunnelManager struct {
 	// Obfuscation layer (shared across all channels)
 	obfuscator *dcconn.Obfuscator
 
+	// Bonded mode: all WebRTC lanes are aggregated into one master QUIC
+	// connection over a BondedPacketConn (packet-level striping + FEC).
+	bonded bool
+
 	// Layer 3: staggered refresh coordinator (concurrency ticket + quorum lock)
 	refresh *refreshSupervisor
 }
@@ -696,6 +700,7 @@ func (tm *TunnelManager) Start() error {
 	}
 	p := pool.NewBonded(bc)
 	tm.pool = p
+	tm.bonded = true
 
 	go tm.runTunnels(ctx, p, bc, pairs)
 	return nil
@@ -743,13 +748,13 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			tm.setChannelPhase(i, PhaseBaleConnect, "")
 			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (bonded mode)...", label, i+1, len(pairs))
 
-			// initChannelWithRetry now returns a bonded channel (qconn is the
-			// master QUIC conn shared across all lanes, set by the first lane).
-			ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
-			if ch == nil || qconn == nil {
-				mainLog.Warn("[%s] ❌ Channel init failed (giving up)", label)
-				return
-			}
+		// In bonded mode the per-lane qconn is nil (the master QUIC conn is
+		// shared and established once by dialBondedQUIC). Only require ch.
+		ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
+		if ch == nil {
+			mainLog.Warn("[%s] ❌ Channel init failed (giving up)", label)
+			return
+		}
 
 			// Register the lane's rtpconn into the shared bond.
 			if ch.sfu != nil {
@@ -1134,6 +1139,26 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		return nil, nil, PhaseTunnelSetup, fmt.Errorf("%s", errStr)
 	}
 
+	// ── Bonded mode: do NOT dial a per-lane QUIC connection. ──────────────
+	// The rtpConn is registered as a lane on the shared BondedPacketConn by
+	// runTunnels (AddLane), and a single master quic.Dial is performed once
+	// (dialBondedQUIC) over ALL lanes. Per-lane dialing would emit raw QUIC
+	// packets (no bond header) that the server's laneReader cannot parse,
+	// causing the server's QUIC listener to never receive the handshake.
+	if tm.bonded {
+		mainLog.Info("[%s] Bonded lane ready — master QUIC dial handled by bond", label)
+		ch = &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			sfu:    sfu,
+			cfg:    &chanCfg,
+			pair:   tp,
+			qconn:  nil, // master QUIC conn is shared; set via pool.SetMasterConn
+		}
+		return ch, nil, PhaseTunnelActive, nil
+	}
+
 	// Build OpusPacketConn: bridges quic-go to the 20ms-paced Opus RTP track
 	opusPC := quicconn.NewClient(rtpConn)
 
@@ -1231,9 +1256,11 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 // one QUIC conn rides over ALL lanes simultaneously via packet striping.
 func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.TunnelPool, bc *quicconn.BondedPacketConn) {
 	// Build QUIC config with enlarged windows for 5-lane bonded transport.
-	initPktSize := uint16(1136) // 1140 - 4 bytes bond header overhead
+	// MTU budget: RTP payload limit (~1140) − 5-byte bond header − 40-byte
+	// XChaCha20 overhead (when obfuscation is on).
+	initPktSize := uint16(1135) // 1140 - 5 bytes bond header
 	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
-		initPktSize = 1096 // additional 40-byte XChaCha20 overhead
+		initPktSize = 1095 // 1140 - 5 bond header - 40 XChaCha20
 	}
 	quicCfg := &quic.Config{
 		InitialPacketSize:              initPktSize,

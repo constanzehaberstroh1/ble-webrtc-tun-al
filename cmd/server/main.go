@@ -714,11 +714,11 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	// InitialPacketSize=1136 in bonded mode (1140 - 4 bytes bond header).
-	// Falls back to 1096 if obfuscation is on (reserves 40 bytes for XChaCha20).
-	initPktSize := uint16(1136)
+	// MTU budget: RTP payload limit (~1140) − 5-byte bond header − 40-byte
+	// XChaCha20 overhead (when obfuscation is on). Must match the client.
+	initPktSize := uint16(1135)
 	if serverObf != nil && serverObf.Enabled() {
-		initPktSize = 1096
+		initPktSize = 1095
 	}
 	// BBR-style window tuning: large receive windows prevent Cubic's window-halving
 	// from throttling throughput when firewall-induced drops occur on lossy lines.
