@@ -714,12 +714,14 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	// MTU budget: RTP payload limit (~1140) − 5-byte bond header − 40-byte
-	// XChaCha20 overhead (when obfuscation is on). Must match the client.
-	initPktSize := uint16(1135)
-	if serverObf != nil && serverObf.Enabled() {
-		initPktSize = 1095
-	}
+	// InitialPacketSize is clamped to 950 bytes to match the client.
+	// The meet-gwbm*.ble.ir VoIP media gateways silently drop UDP payloads
+	// exceeding ~1100 bytes. The QUIC handshake packets (Initial, Handshake)
+	// must fit within this limit or the TLS handshake times out. 950 provides
+	// a safe margin for the 5-byte bond header and obfuscation overhead in all
+	// combinations, and must be identical on client and server.
+	const initPktSize = uint16(950)
+
 	// BBR-style window tuning: large receive windows prevent Cubic's window-halving
 	// from throttling throughput when firewall-induced drops occur on lossy lines.
 	// The bonded 5-lane transport can deliver up to 5× single-lane bandwidth;

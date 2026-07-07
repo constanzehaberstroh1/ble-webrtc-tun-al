@@ -145,9 +145,12 @@ func (br *BondRegistry) RegisterLane(
 	}
 
 	// All lanes wait for the QUIC connection to be accepted (or the group to
-	// fail). The 90s fallback is a safety net; startListener's own Accept
-	// timeout terminates the group on its own.
-	const acceptTimeout = 90 * time.Second
+	// fail). The 3-minute fallback is a safety net; startListener's own Accept
+	// timeout terminates the group on its own. The 3-minute budget covers:
+	//   - Client dialTimeout (45s) + QUIC retransmission backoff (~30s)
+	//   - 5-lane stagger time (~10s)
+	//   - WaitForMaster guard on client side (50s)
+	const acceptTimeout = 3 * time.Minute
 	select {
 	case <-grp.ready:
 		grp.mu.Lock()
@@ -211,7 +214,9 @@ func (br *BondRegistry) startListener(
 
 	bondRegLog.Info("[BondReg] Group 0x%08x: QUIC listener ready — waiting for client", grp.id)
 
-	const acceptTimeout = 90 * time.Second
+	// 3-minute window: must outlast client dialTimeout (45s) + QUIC
+	// retransmission backoff (up to ~30s) + WaitForMaster guard (50s).
+	const acceptTimeout = 3 * time.Minute
 	accCtx, accCancel := context.WithTimeout(ctx, acceptTimeout)
 	defer accCancel()
 

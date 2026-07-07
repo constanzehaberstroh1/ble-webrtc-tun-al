@@ -815,12 +815,12 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	//   6. Server gets ENDCALL → terminates sessions (ADMIN_FORCE_KILL)
 	//
 	// WaitForMaster blocks until SetMasterConn (success) or SetMasterFailed
-	// (failure/timeout) is called by dialBondedQUIC. The 25s timeout is
-	// slightly larger than dialBondedQUIC's own 20s dialTimeout, guaranteeing
+	// (failure/timeout) is called by dialBondedQUIC. The 50s timeout is
+	// slightly larger than dialBondedQUIC's own 45s dialTimeout, guaranteeing
 	// we always get a definitive answer.
 	if tm.bonded {
-		mainLog.Info("[Manager] Waiting for master QUIC dial to resolve (up to 25s)...")
-		if !tunnelPool.WaitForMaster(25 * time.Second) {
+		mainLog.Info("[Manager] Waiting for master QUIC dial to resolve (up to 50s)...")
+		if !tunnelPool.WaitForMaster(50 * time.Second) {
 			mainLog.Error("[Manager] ❌ Master QUIC dial failed — cannot start proxy. Will retry on reconnect.")
 			tm.mu.Lock()
 			tm.lastError = "master QUIC dial failed or timed out"
@@ -1288,12 +1288,19 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 // one QUIC conn rides over ALL lanes simultaneously via packet striping.
 func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.TunnelPool, bc *quicconn.BondedPacketConn) {
 	// Build QUIC config with enlarged windows for 5-lane bonded transport.
-	// MTU budget: RTP payload limit (~1140) − 5-byte bond header − 40-byte
-	// XChaCha20 overhead (when obfuscation is on).
-	initPktSize := uint16(1135) // 1140 - 5 bytes bond header
-	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
-		initPktSize = 1095 // 1140 - 5 bond header - 40 XChaCha20
-	}
+	//
+	// InitialPacketSize is clamped to 950 bytes — well below the ~1100-byte
+	// limit enforced by the meet-gwbm*.ble.ir VoIP media gateways. The QUIC
+	// Initial packet carries the full TLS ClientHello; if it exceeds the
+	// gateway's hard payload limit it is silently dropped, causing the
+	// handshake to time out with "context deadline exceeded" regardless of
+	// how much time is given. 950 leaves a safe ~150-byte headroom even with
+	// the 5-byte bond header and 40-byte XChaCha20 overhead combined.
+	//
+	// NOTE: This overrides obfuscation-based sizing because the gateway MTU
+	// restriction applies in both modes.
+	const initPktSize = uint16(950)
+
 	quicCfg := &quic.Config{
 		InitialPacketSize:              initPktSize,
 		MaxIdleTimeout:                 30 * time.Second,
@@ -1308,7 +1315,7 @@ func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.Tu
 		// EnableDatagrams enables RFC 9221 QUIC datagrams.
 		// Required for future BBR-via-datagram feedback integration;
 		// harmless when not used (QUIC still operates normally).
-		EnableDatagrams:               true,
+		EnableDatagrams: true,
 	}
 
 	mainLog.Info("[Bond] Dialing master QUIC connection over bonded transport (%d lanes)...", bc.LaneCount())
@@ -1318,11 +1325,17 @@ func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.Tu
 	// idempotent (guarded by masterDoneOnce), so the defer is a safety net.
 	defer tunnelPool.SetMasterFailed()
 
-	// Single dial attempt with a bounded context. QUIC retransmits its Initial
-	// internally, so re-dialing on the same BondedPacketConn is unnecessary and
-	// unsafe (reorder-buffer state). 20s gives the staggered server lanes time
-	// to register their shared listener.
-	const dialTimeout = 20 * time.Second
+	// Single dial attempt with a 45-second context.
+	//
+	// Previous value was 20s. With ~900ms RTT observed on the meet-gwbm*
+	// gateways, QUIC's Initial retransmission schedule (0.5s → 1s → 2s → 4s
+	// → 8s …) can consume the entire 20s window without completing the
+	// handshake if even one retransmission is dropped. 45s allows 3–4 full
+	// retransmission cycles while still providing a responsive failure signal.
+	//
+	// Re-dialing on the same BondedPacketConn is unsafe (reorder-buffer state
+	// is not reset), so one bounded attempt is correct.
+	const dialTimeout = 45 * time.Second
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
 	defer dialCancel()
 
