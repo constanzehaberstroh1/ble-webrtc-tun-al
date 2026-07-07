@@ -776,17 +776,20 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			mu.Unlock()
 			mainLog.Info("[%s] ✅ Lane ready! (%d lanes bonded)", label, tunnelPool.LaneCount())
 
-			// Start proxies as soon as first lane is bonded and QUIC is up.
-			proxyOnce.Do(func() {
-				// Wait briefly for QUIC to establish before accepting proxy conns.
-				time.Sleep(500 * time.Millisecond)
-				go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-				go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-				mainLog.Info(" ✅ Proxies started (bonded mode, first lane up)!")
-				for _, ip := range getLocalIPs() {
-					mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-				}
-			})
+			// Start proxies once the master QUIC connection is confirmed.
+			// In bonded mode the dial is asynchronous; we MUST wait for it
+			// before accepting proxy traffic or every connection attempt will
+			// fail (no master conn in the pool yet). WaitForMaster is already
+			// called in runTunnels after wg.Wait, so by the time the goroutine
+			// below runs in proxyOnce, the master is guaranteed to be set.
+			//
+			// proxyOnce ensures this only runs once across all lane goroutines,
+			// but here we are still inside the per-lane goroutine: at this point
+			// the lane is up but WaitForMaster hasn't fired yet (it fires after
+			// wg.Wait). The proxy is started from proxyOnce in runTunnels after
+			// WaitForMaster confirms success, so do NOT start proxies here.
+			// (proxyOnce.Do is a no-op if already called from runTunnels)
+			_ = proxyOnce // proxy is started from runTunnels after WaitForMaster
 
 			go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
 		}(i, pair)
@@ -841,6 +844,20 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		return
 	}
 	mainLog.Info(" 🟢 %d/%d channels active — READY", active, len(pairs))
+
+	// Start SOCKS5 / HTTP proxies AFTER WaitForMaster has confirmed the
+	// master QUIC connection is live. Starting them earlier (inside the
+	// per-lane goroutines, before the handshake completes) caused every
+	// incoming proxy connection to fail immediately because the pool had
+	// no master conn yet.
+	proxyOnce.Do(func() {
+		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
+		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+		mainLog.Info(" ✅ Proxies started (QUIC master confirmed)!")
+		for _, ip := range getLocalIPs() {
+			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+		}
+	})
 
 	// Health monitor + stats (lightweight sampling, doesn't affect VPN throughput)
 	ticker := time.NewTicker(3 * time.Second)
@@ -952,7 +969,9 @@ func (tm *TunnelManager) monitorAndReconnect(
 				tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 				tm.refresh.release()
 
-				if currentCh != nil && currentQConn != nil {
+				if currentCh != nil {
+				// In bonded mode currentQConn is nil by design. Treat a
+				// non-nil currentCh as success regardless of currentQConn.
 					backoff = 3 * time.Second
 					proxyOnce.Do(func() {
 						go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
@@ -1052,7 +1071,11 @@ func (tm *TunnelManager) monitorAndReconnect(
 		// and re-dials via initChannelWithRetry (Layer 1+2).
 		tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 
-		if currentCh == nil || currentQConn == nil {
+		if currentCh == nil {
+			// In bonded mode currentQConn is nil by design (the master QUIC
+			// connection is shared via pool, not per-channel). Do NOT include
+			// currentQConn in this check or every bonded reconnect is falsely
+			// treated as a failure, creating an infinite recovery loop.
 			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
 			backoff = min(backoff*2, maxBackoff)
 			continue
