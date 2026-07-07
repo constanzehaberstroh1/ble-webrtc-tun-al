@@ -1,26 +1,37 @@
 // Package quicconn — reorder_buffer.go
 //
-// Sliding-window priority-queue for reassembling packets that arrive out of
-// order due to varying per-lane latencies in the BondedPacketConn.
+// Sliding-window priority-queue for reassembling packets that arrive
+// out-of-order due to varying per-lane latencies in the BondedPacketConn.
 //
-// Design decisions:
-//   - Window size 64 is intentionally small: at 1140 bytes/pkt and 5 lanes,
-//     a 64-slot window covers ~73 KB of in-flight data — more than enough to
-//     absorb inter-lane jitter without accumulating queue delay.
-//   - The 15ms slide timeout is a hard upper bound so that a single dropped
-//     packet on one lane doesn't stall all other data indefinitely.
+// Design decisions (revised):
+//   - Window size 256 (up from 64): at 1136 bytes/packet and 5 bonded lanes,
+//     a 256-slot window covers ~290 KB of in-flight data, safely absorbing
+//     inter-lane jitter even at multi-megabit aggregate speeds.
+//   - Adaptive slide timeout replaces the fixed 15ms: the timeout tracks the
+//     observed inter-lane jitter (EWMA) and adjusts between 5ms and 100ms.
+//     Low jitter → tight 5ms timeout for minimum added latency.
+//     High jitter → wider window to give FEC time to reconstruct.
+//   - Deduplication bitmask handles hedged (speculative) duplicate packets.
 //   - All public methods are safe for concurrent use by multiple lane readers.
 package quicconn
 
 import (
+	"math"
 	"sync"
 	"time"
 )
 
 const (
-	reorderWindowSize = 64   // number of in-flight sequence slots
-	slideTimeoutMs    = 15   // ms to wait for a gap before forcing a slide
-	maxSeqID          = 1<<16 // uint16 wrap-around boundary
+	// reorderWindowSize must be a power of two for clean modulo masking.
+	// 256 slots at ~1136 bytes each ≈ 290 KB in-flight capacity.
+	reorderWindowSize = 256
+
+	// slideTimeoutMin / Max define the adaptive timeout bounds.
+	slideTimeoutMinMs = 5   // ms — minimum: used when all lanes are in sync
+	slideTimeoutMaxMs = 100 // ms — maximum: used under high inter-lane jitter
+
+	// maxSeqID is the uint16 wrap-around boundary.
+	maxSeqID = 1 << 16
 )
 
 // reorderSlot holds one buffered packet.
@@ -30,7 +41,9 @@ type reorderSlot struct {
 }
 
 // reorderBuffer is a lock-protected sliding-window queue.
-// Packets are inserted by sequence ID; the consumer reads them in order.
+//
+// The consumer calls Next() to obtain packets in strict sequence order.
+// Multiple lane-reader goroutines call Insert() concurrently.
 type reorderBuffer struct {
 	mu           sync.Mutex
 	cond         *sync.Cond
@@ -38,20 +51,34 @@ type reorderBuffer struct {
 	nextExpected uint16 // sequence ID the consumer is waiting for
 	closed       bool
 
-	// Deduplication bitmask for hedged packets (IS_HEDGED flag).
-	// A simple 65536-bit map; bit N is set when seq N has been delivered.
-	seen [8192]uint8 // 8192 bytes × 8 bits = 65536 bits
+	// Deduplication bitmask for hedged (IS_HEDGED) packets.
+	// 8192 bytes × 8 bits = 65536 bits — one bit per uint16 seq.
+	seen [8192]uint8
+
+	// Adaptive slide timeout state.
+	// avgJitterMs tracks the exponential moving average of the per-packet
+	// inter-arrival gap (i.e. how spread out arrivals are across lanes).
+	avgJitterMs float64 // EWMA, in milliseconds
+
+	// Last time a packet was inserted (used to compute inter-arrival gap).
+	lastInsert time.Time
 }
 
 func newReorderBuffer() *reorderBuffer {
-	rb := &reorderBuffer{}
+	rb := &reorderBuffer{
+		avgJitterMs: float64(slideTimeoutMinMs),
+		lastInsert:  time.Now(),
+	}
 	rb.cond = sync.NewCond(&rb.mu)
 	return rb
 }
 
 // Insert places a packet into the sliding window at its sequence position.
-// Returns false if the packet is a duplicate (hedged copy already seen).
-// Thread-safe; called from multiple lane reader goroutines.
+//
+//   - isHedged: if true, deduplication bitmask is checked before inserting.
+//   - Returns false if the packet is a duplicate or outside the window.
+//
+// Thread-safe; called from multiple lane-reader goroutines simultaneously.
 func (rb *reorderBuffer) Insert(seq uint16, data []byte, isHedged bool) bool {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -60,25 +87,31 @@ func (rb *reorderBuffer) Insert(seq uint16, data []byte, isHedged bool) bool {
 		return false
 	}
 
-	// Deduplicate hedged packets by bitmask.
-	if isHedged {
-		byteIdx := seq / 8
-		bitIdx := seq % 8
-		if rb.seen[byteIdx]&(1<<bitIdx) != 0 {
-			return false // already delivered
+	// ── Deduplication for hedged packets ────────────────────────────────
+	byteIdx := seq / 8
+	bitIdx := seq % 8
+	if isHedged && (rb.seen[byteIdx]&(1<<bitIdx)) != 0 {
+		return false // duplicate hedged copy — discard
+	}
+
+	// ── Update adaptive jitter EWMA ───────────────────────────────────
+	now := time.Now()
+	if !rb.lastInsert.IsZero() {
+		gapMs := float64(now.Sub(rb.lastInsert).Milliseconds())
+		if gapMs > 0 && gapMs < 500 { // ignore outliers from idle periods
+			const alpha = 0.15
+			rb.avgJitterMs = rb.avgJitterMs*(1-alpha) + gapMs*alpha
 		}
 	}
+	rb.lastInsert = now
 
-	// Calculate slot index relative to the current window base.
+	// ── Check window bounds ───────────────────────────────────────────
 	diff := int(seq) - int(rb.nextExpected)
 	if diff < 0 {
-		// Wrap-around correction for uint16 overflow.
 		diff += maxSeqID
 	}
-
 	if diff >= reorderWindowSize {
-		// Packet is outside the current window (too far ahead or old).
-		// Drop it; the FEC layer should reconstruct any gap this causes.
+		// Too far ahead or too old — drop.
 		return false
 	}
 
@@ -90,8 +123,10 @@ func (rb *reorderBuffer) Insert(seq uint16, data []byte, isHedged bool) bool {
 	return true
 }
 
-// Next blocks until the next sequential packet is ready or 15ms elapses.
-// On timeout, the window slides forward by 1 (accepting the gap).
+// Next blocks until the next sequential packet is ready.
+//
+// If the expected slot is empty after the adaptive timeout fires, the window
+// slides forward by one position (gap accepted — FEC should have covered it).
 // Returns nil only when Close() has been called.
 func (rb *reorderBuffer) Next() []byte {
 	rb.mu.Lock()
@@ -105,37 +140,49 @@ func (rb *reorderBuffer) Next() []byte {
 		slotIdx := int(rb.nextExpected) % reorderWindowSize
 		if rb.slots[slotIdx].set {
 			data := rb.slots[slotIdx].data
-			rb.slots[slotIdx] = reorderSlot{} // clear
-			// Mark as seen in dedup bitmask.
+			rb.slots[slotIdx] = reorderSlot{} // clear slot
+
+			// Mark seq as seen in dedup bitmask.
 			byteIdx := rb.nextExpected / 8
 			bitIdx := rb.nextExpected % 8
 			rb.seen[byteIdx] |= 1 << bitIdx
+
 			rb.nextExpected++
 			return data
 		}
 
-		// Wait for a signal or 15ms timeout.
-		waitDone := make(chan struct{}, 1)
-		go func() {
-			time.Sleep(slideTimeoutMs * time.Millisecond)
+		// ── Adaptive timeout calculation ──────────────────────────────
+		// slideTimeout = clamp(avgJitter × 1.5, 5ms, 100ms)
+		jitterTimeout := rb.avgJitterMs * 1.5
+		jitterTimeout = math.Max(float64(slideTimeoutMinMs), jitterTimeout)
+		jitterTimeout = math.Min(float64(slideTimeoutMaxMs), jitterTimeout)
+		slideTimeout := time.Duration(jitterTimeout) * time.Millisecond
+
+		// Wake up after the adaptive timeout to slide past a gap.
+		timedOut := make(chan struct{}, 1)
+		go func(d time.Duration) {
+			time.Sleep(d)
 			rb.cond.Signal()
-			waitDone <- struct{}{}
-		}()
+			timedOut <- struct{}{}
+		}(slideTimeout)
 
 		rb.cond.Wait()
 
-		// Drain the timer goroutine notification.
+		// Drain the background goroutine's notification.
 		select {
-		case <-waitDone:
+		case <-timedOut:
 		default:
 		}
 
-		// Re-check: if still not set after 15ms, force a slide.
+		// Re-check: if still empty after timeout, slide the window.
 		if !rb.slots[slotIdx].set {
-			rb.nextExpected++ // slide past the gap
-			// The FEC layer will have attempted reconstruction; if it
-			// couldn't, QUIC will detect the missing datagram and handle
-			// it at the transport layer (BBR keeps the window open).
+			// Gap persisted — force slide. FEC should have reconstructed;
+			// if not, QUIC will handle it via its own loss detection.
+			rb.avgJitterMs = math.Min(rb.avgJitterMs*1.2, float64(slideTimeoutMaxMs))
+			rb.nextExpected++
+		} else {
+			// Packet arrived — reward with tighter timeout next time.
+			rb.avgJitterMs = math.Max(rb.avgJitterMs*0.9, float64(slideTimeoutMinMs))
 		}
 	}
 }
@@ -148,12 +195,14 @@ func (rb *reorderBuffer) Close() {
 	rb.mu.Unlock()
 }
 
-// Reset resets the buffer to a clean state for reuse (e.g. after reconnect).
+// Reset resets the buffer to a clean state (e.g. after reconnect).
 func (rb *reorderBuffer) Reset(startSeq uint16) {
 	rb.mu.Lock()
 	rb.slots = [reorderWindowSize]reorderSlot{}
 	rb.seen = [8192]uint8{}
 	rb.nextExpected = startSeq
 	rb.closed = false
+	rb.avgJitterMs = float64(slideTimeoutMinMs)
+	rb.lastInsert = time.Now()
 	rb.mu.Unlock()
 }
