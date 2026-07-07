@@ -230,7 +230,11 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 		}
 
 		ch, qconn, failPhase, failErr := tm.initChannelTracked(ctx, idx, tp, label)
-		if ch != nil && qconn != nil {
+		// In bonded mode initChannelTracked returns a non-nil ch with qconn==nil
+		// (the master QUIC conn is shared and dialed separately). Only ch is
+		// required there; requiring qconn!=nil would treat every bonded success
+		// as a failure and loop forever (re-dialing the SFU each time).
+		if ch != nil && (qconn != nil || tm.bonded) {
 			return ch, qconn
 		}
 

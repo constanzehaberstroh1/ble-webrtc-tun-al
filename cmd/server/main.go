@@ -759,6 +759,8 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	if bondErr != nil {
 		adminPanel.AddLog("error", tag+" Bond registration failed: "+bondErr.Error())
 		mainLog.Error("%s Bond registration failed: %v", tag, bondErr)
+		// Clean up this lane so stale rtpconns don't accumulate in the bond.
+		globalBondRegistry.RemoveLane(simpleBondGroupID, rtpConn)
 		return
 	}
 	_ = bondedPC // the BondedPacketConn is managed by the registry
