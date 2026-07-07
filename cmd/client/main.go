@@ -882,7 +882,12 @@ func (tm *TunnelManager) monitorAndReconnect(
 		// ── Layer 3: Staggered Refresh ────────────────────────────────────
 		if currentCh != nil && time.Now().After(refreshAt) {
 			active := tunnelPool.ActiveCount()
-			if tm.refresh.tryAcquire(active) {
+			// FIX (Hole 3): pass tm.pairCount so single-pair setups can bypass
+			// the quorum guard and still perform scheduled refreshes.
+			tm.mu.Lock()
+			totalPairs := tm.pairCount
+			tm.mu.Unlock()
+			if tm.refresh.tryAcquire(active, totalPairs) {
 				mainLog.Info("[%s] 🔄 Scheduled refresh granted (active=%d) — rotating connection", label, active)
 				tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 				tm.refresh.release()
@@ -902,8 +907,20 @@ func (tm *TunnelManager) monitorAndReconnect(
 					}
 					continue
 				}
-				// Refresh failed to re-establish — defer and let the death
-				// path below drive the next reconnect attempt.
+				// FIX (Hole 1 — Zombie Spin): refresh failed (currentCh == nil).
+				// refreshChannel now sets PhaseError on fatal failure. If that
+				// happened, exit the goroutine cleanly instead of spinning.
+				// Otherwise defer and let the death path below drive recovery.
+				tm.channelMu.RLock()
+				var curPhase ChannelPhase
+				if idx < len(tm.channelStatus) {
+					curPhase = tm.channelStatus[idx].Phase
+				}
+				tm.channelMu.RUnlock()
+				if curPhase == PhaseError {
+					mainLog.Error("[%s] ❌ Refresh hit PhaseError — terminating monitor goroutine", label)
+					return
+				}
 				refreshAt = time.Now().Add(time.Duration(2+rand.Intn(4)) * time.Minute)
 			} else {
 				// Denied: another channel is refreshing, or quorum would be
@@ -913,6 +930,26 @@ func (tm *TunnelManager) monitorAndReconnect(
 				mainLog.Info("[%s] ⏳ Refresh deferred (busy/quorum active=%d) — retry in %v",
 					label, active, deferDur)
 			}
+		}
+
+		// ── Liveness probes ───────────────────────────────────────────────
+		// FIX (Hole 1 — Zombie Spin): if both pointers are nil (e.g. after a
+		// catastrophic refresh failure that did NOT set PhaseError), force dead=true
+		// so the death-reconnect path below immediately kicks in instead of
+		// continuing the loop with no work being done.
+		if currentCh == nil && currentQConn == nil {
+			// Check phase in case we should exit entirely.
+			tm.channelMu.RLock()
+			var curPhase ChannelPhase
+			if idx < len(tm.channelStatus) {
+				curPhase = tm.channelStatus[idx].Phase
+			}
+			tm.channelMu.RUnlock()
+			if curPhase == PhaseError {
+				mainLog.Error("[%s] ❌ PhaseError with nil channel — terminating monitor goroutine", label)
+				return
+			}
+			// Non-fatal nil state: fall through as dead so the reconnect runs.
 		}
 
 		// ── Liveness probes ───────────────────────────────────────────────

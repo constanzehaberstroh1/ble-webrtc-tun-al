@@ -22,6 +22,9 @@ import (
 //   1. Mutual-Exclusion: no other channel is currently refreshing (limit = 1).
 //   2. Quorum-Safety: at least 2 channels are active so that removing the
 //      refreshing one still leaves >= 1 channel carrying traffic.
+//      Exception: if the total configured pair count is 1, quorum is relaxed
+//      to allow single-channel deployments to still refresh (accepting a
+//      brief downtime window) — otherwise they never refresh at all.
 //
 // This prevents "load-shedding blackouts" where multiple lines refresh at the
 // same time and overload the Bale signaling plane.
@@ -33,15 +36,21 @@ type refreshSupervisor struct {
 }
 
 // tryAcquire grants a refresh ticket if no other channel is refreshing AND the
-// quorum-safety constraint is satisfied (activeCount >= 2 so one survives).
-func (rs *refreshSupervisor) tryAcquire(activeCount int) bool {
+// quorum-safety constraint is satisfied.
+//
+// FIX (Hole 3 — Single-Pair Quorum Starvation): totalPairs is now required.
+// When totalPairs == 1 the minimum-active-count guard is bypassed so that
+// single-channel deployments can still schedule periodic refreshes instead of
+// being permanently locked out and silently degrading WebRTC quality.
+func (rs *refreshSupervisor) tryAcquire(activeCount, totalPairs int) bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if rs.refreshing {
 		return false
 	}
-	if activeCount < 2 {
-		// Refreshing would drop the pool to 0 active — never allow that.
+	// Multi-channel: must keep at least one survivor during refresh.
+	// Single-channel: relax the quorum constraint — a momentary gap is acceptable.
+	if totalPairs > 1 && activeCount < 2 {
 		return false
 	}
 	rs.refreshing = true
@@ -110,31 +119,59 @@ func isTokenError(msg string) bool {
 // Layer 2: Controlled Disruption Retries & Clean Hangup Protocol
 // =============================================================================
 
-// endCallForPair sends BLETUN:ENDCALL to a single paired server account via a
-// transient Bale WebSocket, waits for BLETUN:ENDCALL_ACK, then erases message
-// traces. This forces the paired server out of any stuck RESERVED/IN_CALL
-// state back to IDLE so a fresh handshake can succeed.
+// endCallForPair sends BLETUN:ENDCALL to a single paired server account, waits
+// for BLETUN:ENDCALL_ACK, then erases message traces. This forces the paired
+// server out of any stuck RESERVED/IN_CALL state back to IDLE.
 //
-// This is the out-of-band pre-flight signaling loop: it operates independently
-// of the channel's own (possibly dead) Bale client and reuses the server's
-// existing ENDCALL handling path.
-func (tm *TunnelManager) endCallForPair(ctx context.Context, tp config.TokenPair, label string) bool {
+// FIX (Hole 2 — Dual-Session Token Collision): existingClient is now accepted.
+// If the caller holds a healthy, already-connected *bale.Client for this token
+// pair (e.g. during a Layer 3 scheduled refresh where the channel is still up),
+// it is reused directly — no second login is performed. A second simultaneous
+// connection with the same JWT would trigger a duplicate-session event on the
+// platform, causing the server to drop the older (active) socket prematurely.
+//
+// existingClient == nil means the channel is dead and a fresh transient client
+// must be created (the Layer 2 death-reconnect path).
+func (tm *TunnelManager) endCallForPair(ctx context.Context, tp config.TokenPair, label string, existingClient *bale.Client) bool {
 	if tp.ClientToken == "" || tp.TargetUserID == 0 {
 		return false
 	}
 
-	client := bale.NewClient(tp.ClientToken)
-	if err := client.Connect(); err != nil {
-		mainLog.Warn("[%s] ENDCALL: Bale connect failed: %v", label, err)
-		return false
+	var client *bale.Client
+	isTransient := false
+
+	if existingClient != nil {
+		// Reuse the active session — avoids token collision.
+		client = existingClient
+		mainLog.Info("[%s] ENDCALL: reusing active signaling client (no duplicate login)", label)
+	} else {
+		// Channel is dead — spin up a short-lived transient client.
+		client = bale.NewClient(tp.ClientToken)
+		if err := client.Connect(); err != nil {
+			mainLog.Warn("[%s] ENDCALL: transient Bale connect failed: %v", label, err)
+			return false
+		}
+		isTransient = true
+		client.StartPingLoop()
+		time.Sleep(1 * time.Second)
 	}
-	defer client.Close()
-	client.StartPingLoop()
-	time.Sleep(1 * time.Second)
+
+	// Drain stale messages so ACK detection starts from a clean state.
+	for {
+		select {
+		case <-client.TextMsgCh:
+		default:
+			goto drained
+		}
+	}
+drained:
 
 	mainLog.Info("[%s] ENDCALL: sending to %d", label, tp.TargetUserID)
 	if err := client.SendTextMessage(tp.TargetUserID, "BLETUN:ENDCALL"); err != nil {
 		mainLog.Warn("[%s] ENDCALL: send failed: %v", label, err)
+		if isTransient {
+			client.Close()
+		}
 		return false
 	}
 
@@ -144,17 +181,26 @@ func (tm *TunnelManager) endCallForPair(ctx context.Context, tp config.TokenPair
 	for {
 		select {
 		case <-ctx.Done():
+			if isTransient {
+				client.Close()
+			}
 			return false
 		case msg := <-client.TextMsgCh:
 			if msg == "BLETUN:ENDCALL_ACK" {
 				mainLog.Info("[%s] ENDCALL: ACK received — server is IDLE", label)
 				time.Sleep(500 * time.Millisecond)
 				client.CleanupMessages()
+				if isTransient {
+					client.Close()
+				}
 				return true
 			}
 		case <-timeout.C:
 			mainLog.Warn("[%s] ENDCALL: timeout (no ACK) — proceeding anyway", label)
 			client.CleanupMessages()
+			if isTransient {
+				client.Close()
+			}
 			return false
 		}
 	}
@@ -214,8 +260,10 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 			// Layer 2: the paired server may be stranded in RESERVED/IN_CALL.
 			// Force it back to IDLE before re-dialing so the retried call is
 			// accepted instead of rejected as "busy".
+			// The channel is dead at this point, so existingClient = nil:
+			// a transient client must be created (no collision risk here).
 			tm.setChannelPhase(idx, PhaseTeardown, "clean hangup of paired server")
-			tm.endCallForPair(ctx, tp, label)
+			tm.endCallForPair(ctx, tp, label, nil)
 			baleFails = 0
 		}
 
@@ -259,32 +307,58 @@ func (tm *TunnelManager) refreshChannel(
 	}
 
 	// 2. Tear down the old Bale/SFU/QUIC stack.
+	//
+	// FIX (Hole 2 — Token Collision): capture the active Bale client BEFORE
+	// closing the channel so we can pass it to endCallForPair below, avoiding
+	// a duplicate login with the same token while the main connection is still
+	// technically alive on the server side.
+	//
+	// FIX (Hole 4 — Slice Mutation): build a new slice instead of in-place
+	// truncation to avoid backing-array aliasing when other goroutines hold
+	// a snapshot of the old slice header.
+	var activeBaleClient *bale.Client
 	if *curCh != nil {
 		old := *curCh
+		activeBaleClient = old.client // capture before teardown
+
 		go old.client.CleanupMessages()
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		old.sfu.Close()
-		old.client.Close()
+		// Note: old.client is closed below, AFTER endCallForPair has finished
+		// using it. Do NOT call old.client.Close() here.
 
 		mu.Lock()
-		for i, c := range *channels {
-			if c == old {
-				*channels = append((*channels)[:i], (*channels)[i+1:]...)
-				break
+		newSlice := make([]*channelState, 0, len(*channels))
+		for _, c := range *channels {
+			if c != old {
+				newSlice = append(newSlice, c)
 			}
 		}
+		*channels = newSlice
 		mu.Unlock()
 		*curCh = nil
 	}
 
 	// 3. Layer 2: Clean Hangup Protocol — force the paired server to IDLE.
+	//    Pass activeBaleClient so the existing session is reused if healthy
+	//    (scheduled refresh path), or nil to create a transient one (dead path).
 	tm.setChannelPhase(idx, PhaseTeardown, "clean hangup of paired server")
-	tm.endCallForPair(ctx, tp, label)
+	tm.endCallForPair(ctx, tp, label, activeBaleClient)
+
+	// Now safe to close the old Bale client — endCallForPair is done with it.
+	if activeBaleClient != nil {
+		activeBaleClient.Close()
+		activeBaleClient = nil
+	}
 
 	// 4. Re-dial with Layer 1+2 retry (ENDCALL on any further call-phase fail).
 	tm.setChannelPhase(idx, PhaseBaleConnect, "")
 	newCh, newQConn := tm.initChannelWithRetry(ctx, idx, tp, label)
 	if newCh == nil || newQConn == nil {
+		// FIX (Hole 1 — Zombie Spin): set PhaseError so the monitor loop in
+		// monitorAndReconnect can detect a fatal failure and exit cleanly
+		// instead of spinning indefinitely with both pointers nil.
+		tm.setChannelPhase(idx, PhaseError, "reconnect yielded no channel — giving up")
 		return
 	}
 

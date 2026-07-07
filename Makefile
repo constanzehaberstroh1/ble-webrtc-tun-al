@@ -5,8 +5,7 @@ build: build-web build-client build-server build-migrate
 
 # Build frontend and sync to Go embed dir
 build-web:
-	cd web && npm install && npm run build
-	@$(MAKE) sync-web
+	bash build_web.sh
 
 # Copy web/dist → internal/webui/dist (Go embed source)
 sync-web:
