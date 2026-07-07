@@ -185,6 +185,7 @@ func fetchLatestAppVersion(httpClient *http.Client) (string, error) {
 		regexp.MustCompile(`APP_VERSION[:\s=]+["']?(\d{5,7})["']?`),
 		regexp.MustCompile(`"app_version"\s*,\s*"(\d{5,7})"`),
 		regexp.MustCompile(`"app_version":(\d{5,7})`),
+		regexp.MustCompile(`buildNumber[:\s=]+["']?(\d{5,7})["']?`),
 	}
 	for _, pat := range patterns {
 		if m := pat.FindStringSubmatch(jsStr); len(m) >= 2 {

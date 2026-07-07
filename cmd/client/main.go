@@ -719,7 +719,10 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	// to the shared BondedPacketConn. The first successful lane triggers a
 	// single quic.Dial over the bonded transport. All subsequent lanes are
 	// automatically striped by the BondedPacketConn.
-	var wg sync.WaitGroup
+	// === SEQUENTIAL CONNECTION — BONDED MODE ===
+	// Connect channels sequentially. Each channel fully establishes WebRTC
+	// signaling before the next one starts. This completely avoids concurrent
+	// ICE/DTLS negotiations that trigger gateway/TURN rate limits or drops.
 	for i, pair := range pairs {
 		select {
 		case <-ctx.Done():
@@ -727,76 +730,40 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		default:
 		}
 
-		wg.Add(1)
-		go func(i int, pair config.TokenPair) {
-			defer wg.Done()
-
-			label := fmt.Sprintf("ch%d", pair.Index)
-
-			// Stagger: 2s × index — lets each ICE negotiation settle before next starts.
-			if i > 0 {
-				tm.setChannelPhase(i, PhaseInit, "")
-				stagger := time.Duration(i) * 2 * time.Second
-				mainLog.Info("[%s] 🕐 Stagger %.0fs (bonded parallel dial)...", label, stagger.Seconds())
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(stagger):
-				}
-			}
-
-			tm.setChannelPhase(i, PhaseBaleConnect, "")
-			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (bonded mode)...", label, i+1, len(pairs))
+		label := fmt.Sprintf("ch%d", pair.Index)
+		tm.setChannelPhase(i, PhaseBaleConnect, "")
+		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (bonded mode)...", label, i+1, len(pairs))
 
 		// In bonded mode the per-lane qconn is nil (the master QUIC conn is
 		// shared and established once by dialBondedQUIC). Only require ch.
 		ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
 		if ch == nil {
-			mainLog.Warn("[%s] ❌ Channel init failed (giving up)", label)
-			return
+			mainLog.Warn("[%s] ❌ Channel init failed (skipping)", label)
+			continue
 		}
 
-			// Register the lane's rtpconn into the shared bond.
-			if ch.sfu != nil {
-				rtpC := ch.sfu.GetRTPConn()
-				if rtpC != nil {
-					tunnelPool.AddLane(rtpC, label)
-					mainLog.Info("[%s] 🔗 Lane added to bond (%d total lanes)", label, tunnelPool.LaneCount())
-				}
+		// Register the lane's rtpconn into the shared bond.
+		if ch.sfu != nil {
+			rtpC := ch.sfu.GetRTPConn()
+			if rtpC != nil {
+				tunnelPool.AddLane(rtpC, label)
+				mainLog.Info("[%s] 🔗 Lane added to bond (%d total lanes)", label, tunnelPool.LaneCount())
 			}
+		}
 
-			// First lane: dial QUIC once over the shared BondedPacketConn.
-			bondDialOnce.Do(func() {
-				go tm.dialBondedQUIC(ctx, tunnelPool, bc)
-			})
+		// First lane: dial QUIC once over the shared BondedPacketConn.
+		bondDialOnce.Do(func() {
+			go tm.dialBondedQUIC(ctx, tunnelPool, bc)
+		})
 
-			tm.setChannelPhase(i, PhaseTunnelActive, "")
-			mu.Lock()
-			channels = append(channels, ch)
-			mu.Unlock()
-			mainLog.Info("[%s] ✅ Lane ready! (%d lanes bonded)", label, tunnelPool.LaneCount())
+		tm.setChannelPhase(i, PhaseTunnelActive, "")
+		mu.Lock()
+		channels = append(channels, ch)
+		mu.Unlock()
+		mainLog.Info("[%s] ✅ Lane ready! (%d lanes bonded)", label, tunnelPool.LaneCount())
 
-			// Start proxies once the master QUIC connection is confirmed.
-			// In bonded mode the dial is asynchronous; we MUST wait for it
-			// before accepting proxy traffic or every connection attempt will
-			// fail (no master conn in the pool yet). WaitForMaster is already
-			// called in runTunnels after wg.Wait, so by the time the goroutine
-			// below runs in proxyOnce, the master is guaranteed to be set.
-			//
-			// proxyOnce ensures this only runs once across all lane goroutines,
-			// but here we are still inside the per-lane goroutine: at this point
-			// the lane is up but WaitForMaster hasn't fired yet (it fires after
-			// wg.Wait). The proxy is started from proxyOnce in runTunnels after
-			// WaitForMaster confirms success, so do NOT start proxies here.
-			// (proxyOnce.Do is a no-op if already called from runTunnels)
-			_ = proxyOnce // proxy is started from runTunnels after WaitForMaster
-
-			go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
-		}(i, pair)
+		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
 	}
-
-	// Wait for all parallel dials to complete
-	wg.Wait()
 
 	if ctx.Err() != nil {
 		return
