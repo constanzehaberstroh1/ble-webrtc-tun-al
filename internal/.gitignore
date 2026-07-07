@@ -1,0 +1,39 @@
+bin/
+*.exe
+.env
+logs/
+.env.tokens
+data/
+
+# Node
+node_modules/
+web/node_modules/
+web/dist/
+#package.json
+#package-lock.json
+
+# Embedded UI dist is committed (it's embedded into the Go binary)
+# Run `make build-web` to update it before committing
+
+# Sniffer tools (dev only)
+bale_sniffer.py
+cdp_sniffer.py
+bale_cdp_traffic.log
+sniffer.py
+sniffer2.py
+auth_bridge.py
+*.log
+
+# Build artifacts
+migrate
+sniff_output/
+tools/sniff_logs/
+cmd/sniff/
+cmd/test/
+cmd/baletest/
+test_restricted_wifi.sh
+
+# Database files
+*.db
+ble-client
+ble-server

@@ -1,0 +1,10 @@
+{
+  "deploy": {
+    "appIsWebProcess": true,
+    "webCommand": "./bin/server"
+  },
+  "build": {
+    "mainPackage": "./cmd/server",
+    "targetBinary": "./bin/server"
+  }
+}

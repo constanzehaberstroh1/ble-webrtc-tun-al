@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -167,16 +168,17 @@ func main() {
 type ChannelPhase string
 
 const (
-	PhaseInit          ChannelPhase = "INITIALIZING"
-	PhaseBaleConnect   ChannelPhase = "CONNECTING_TO_BALE"
-	PhaseCalling       ChannelPhase = "CALLING_SERVER"
-	PhaseWaitAccept    ChannelPhase = "WAITING_FOR_ACCEPT"
-	PhaseSFUConnect    ChannelPhase = "CONNECTING_TO_SFU"
-	PhaseWaitTrack     ChannelPhase = "WAITING_FOR_TRACK"
-	PhaseTunnelSetup   ChannelPhase = "SETTING_UP_TUNNEL"
-	PhaseTunnelActive  ChannelPhase = "TUNNEL_ACTIVE"
-	PhaseDisconnected  ChannelPhase = "DISCONNECTED"
-	PhaseError         ChannelPhase = "ERROR"
+	PhaseInit         ChannelPhase = "INITIALIZING"
+	PhaseBaleConnect  ChannelPhase = "CONNECTING_TO_BALE"
+	PhaseCalling      ChannelPhase = "CALLING_SERVER"
+	PhaseWaitAccept   ChannelPhase = "WAITING_FOR_ACCEPT"
+	PhaseSFUConnect   ChannelPhase = "CONNECTING_TO_SFU"
+	PhaseWaitTrack    ChannelPhase = "WAITING_FOR_TRACK"
+	PhaseTunnelSetup  ChannelPhase = "SETTING_UP_TUNNEL"
+	PhaseTunnelActive ChannelPhase = "TUNNEL_ACTIVE"
+	PhaseTeardown     ChannelPhase = "TEARDOWN"
+	PhaseDisconnected ChannelPhase = "DISCONNECTED"
+	PhaseError        ChannelPhase = "ERROR"
 )
 
 // ChannelStatus tracks the live state of a single channel/pairing.
@@ -244,12 +246,14 @@ type TunnelManager struct {
 	mode      string // "pairing" or "smart"
 
 	// Per-channel state tracking (thread-safe via channelMu)
-	channelMu      sync.RWMutex
-	channelStatus  []ChannelStatus
+	channelMu     sync.RWMutex
+	channelStatus []ChannelStatus
 
 	// Obfuscation layer (shared across all channels)
 	obfuscator *dcconn.Obfuscator
 
+	// Layer 3: staggered refresh coordinator (concurrency ticket + quorum lock)
+	refresh *refreshSupervisor
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -280,6 +284,7 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		manager:    manager,
 		clientID:   clientID,
 		obfuscator: obf,
+		refresh:    &refreshSupervisor{},
 	}
 }
 
@@ -727,10 +732,14 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			tm.setChannelPhase(i, PhaseBaleConnect, "")
 			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (parallel)...", label, i+1, len(pairs))
 
-			ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
+			// Layer 1+2: initChannelWithRetry classifies failures and runs the
+			// Clean Hangup Protocol (ENDCALL) against the paired server before
+			// each retry, looping until the channel connects or the credential is
+			// deemed permanently invalid.
+			ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
 			if ch == nil || qconn == nil {
-				mainLog.Warn("[%s] ❌ Channel init failed", label)
-				tm.setChannelPhase(i, PhaseError, "init failed")
+				mainLog.Warn("[%s] ❌ Channel init failed (giving up)", label)
+				// PhaseError already set by initChannelWithRetry
 				return
 			}
 
@@ -828,13 +837,18 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	}
 }
 
-
-// monitorAndReconnect watches a QUIC connection and auto-reconnects on failure.
+// monitorAndReconnect watches a QUIC connection and auto-recovers it.
 //
-// Three detection paths (all trigger immediate reconnect):
-//  1. QUIC context cancelled (connection closed by QUIC layer or circuit breaker)
-//  2. WebRTC ICE layer disconnected/failed (binds WebRTC to QUIC lifecycle)
-//  3. Pool circuit breaker forced the connection closed (fail count ≥ kill threshold)
+// Three responsibilities (the self-healing engine):
+//  1. Layer 3 — Staggered Refresh: each channel owns a randomized refresh
+//     window (60–120 min). When it expires the channel requests a ticket from
+//     the refreshSupervisor (mutual-exclusion + quorum-safety). If granted it
+//     cleanly rotates the WebRTC connection to refresh long-term quality.
+//  2. Liveness — detects a dead channel via QUIC context cancellation and/or
+//     WebRTC ICE disconnect/fail.
+//  3. Layer 2 — on death, runs the Clean Hangup Protocol (ENDCALL) against
+//     the paired server before re-dialing, so a stranded server state can't
+//     reject the retried call.
 func (tm *TunnelManager) monitorAndReconnect(
 	ctx context.Context,
 	tunnelPool *pool.TunnelPool,
@@ -853,6 +867,10 @@ func (tm *TunnelManager) monitorAndReconnect(
 	currentQConn := qconn
 	currentCh := ch
 
+	// Layer 3: per-channel randomized refresh deadline.
+	refreshAt := time.Now().Add(tm.nextRefreshInterval())
+	mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
+
 	for {
 		// ── Liveness check every 3s ───────────────────────────────────────
 		select {
@@ -861,14 +879,52 @@ func (tm *TunnelManager) monitorAndReconnect(
 		case <-time.After(3 * time.Second):
 		}
 
+		// ── Layer 3: Staggered Refresh ────────────────────────────────────
+		if currentCh != nil && time.Now().After(refreshAt) {
+			active := tunnelPool.ActiveCount()
+			if tm.refresh.tryAcquire(active) {
+				mainLog.Info("[%s] 🔄 Scheduled refresh granted (active=%d) — rotating connection", label, active)
+				tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
+				tm.refresh.release()
+
+				if currentCh != nil && currentQConn != nil {
+					backoff = 3 * time.Second
+					proxyOnce.Do(func() {
+						go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
+						go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+					})
+					refreshAt = time.Now().Add(tm.nextRefreshInterval())
+					mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+					continue
+				}
+				// Refresh failed to re-establish — defer and let the death
+				// path below drive the next reconnect attempt.
+				refreshAt = time.Now().Add(time.Duration(2+rand.Intn(4)) * time.Minute)
+			} else {
+				// Denied: another channel is refreshing, or quorum would be
+				// violated. Defer by a randomized 2–5 min window and retry.
+				deferDur := time.Duration(2+rand.Intn(4)) * time.Minute
+				refreshAt = time.Now().Add(deferDur)
+				mainLog.Info("[%s] ⏳ Refresh deferred (busy/quorum active=%d) — retry in %v",
+					label, active, deferDur)
+			}
+		}
+
+		// ── Liveness probes ───────────────────────────────────────────────
 		dead := false
+		reason := ""
 
 		// Check 1: QUIC connection context (catches circuit-breaker kills too)
 		if currentQConn != nil {
 			select {
 			case <-currentQConn.Context().Done():
-				mainLog.Warn("[%s] QUIC connection dead (context cancelled)", label)
 				dead = true
+				reason = "QUIC context cancelled"
 			default:
 			}
 		}
@@ -878,8 +934,8 @@ func (tm *TunnelManager) monitorAndReconnect(
 		if !dead && currentCh != nil && currentCh.sfu != nil {
 			health := currentCh.sfu.GetHealth()
 			if health.PubICEState == "disconnected" || health.PubICEState == "failed" {
-				mainLog.Warn("[%s] ⚠️ WebRTC ICE is %s — force-killing QUIC", label, health.PubICEState)
 				dead = true
+				reason = "WebRTC ICE " + health.PubICEState
 			}
 		}
 
@@ -887,54 +943,22 @@ func (tm *TunnelManager) monitorAndReconnect(
 			continue // still alive
 		}
 
-		// ── Reconnect flow ────────────────────────────────────────────────
-		mainLog.Warn("[%s] 💀 Channel dead — reconnecting (backoff: %.0fs)", label, backoff.Seconds())
-		tm.setChannelPhase(idx, PhaseDisconnected, "channel dead, reconnecting...")
+		// ── Layer 2: death reconnect (with Clean Hangup Protocol) ─────────
+		mainLog.Warn("[%s] 💀 Channel dead (%s) — reconnecting (backoff: %.0fs)", label, reason, backoff.Seconds())
+		tm.setChannelPhase(idx, PhaseDisconnected, reason)
 
-		if currentQConn != nil {
-			tunnelPool.Remove(currentQConn)
-			currentQConn.CloseWithError(0, "reconnecting")
-		}
-		if currentCh != nil {
-			go func(c *channelState) { c.client.CleanupMessages() }(currentCh)
-			time.Sleep(500 * time.Millisecond)
-			currentCh.sfu.Close()
-			currentCh.client.Close()
-		}
+		// refreshChannel tears down the old stack, ENDCALLs the paired server,
+		// and re-dials via initChannelWithRetry (Layer 1+2).
+		tm.refreshChannel(ctx, tunnelPool, &currentCh, &currentQConn, idx, tp, label, mu, channels)
 
-		mu.Lock()
-		for i, c := range *channels {
-			if c == currentCh {
-				*channels = append((*channels)[:i], (*channels)[i+1:]...)
-				break
-			}
-		}
-		mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-
-		tm.setChannelPhase(idx, PhaseBaleConnect, "")
-		newCh, newQConn := tm.initChannelTracked(ctx, idx, tp, label)
-		if newCh == nil || newQConn == nil {
+		if currentCh == nil || currentQConn == nil {
 			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
 			backoff = min(backoff*2, maxBackoff)
 			continue
 		}
 
-		tm.setChannelPhase(idx, PhaseTunnelActive, "")
-		tunnelPool.Add(newQConn, label)
-		mu.Lock()
-		*channels = append(*channels, newCh)
-		mu.Unlock()
 		mainLog.Info("[%s] ✅ Reconnected!", label)
-
 		backoff = 3 * time.Second
-		currentQConn = newQConn
-		currentCh = newCh
 
 		proxyOnce.Do(func() {
 			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
@@ -949,7 +973,6 @@ func (tm *TunnelManager) monitorAndReconnect(
 	}
 }
 
-
 func min(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
@@ -959,7 +982,9 @@ func min(a, b time.Duration) time.Duration {
 
 // initChannelTracked establishes: Bale call → SFU → QUIC connection.
 // Returns the channelState and the QUIC connection for the pool.
-func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp config.TokenPair, label string) (*channelState, quic.Connection) {
+// On failure, failPhase is the phase at which the handshake broke and failErr
+// describes the cause — used by the Layer 1 error classifier.
+func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp config.TokenPair, label string) (ch *channelState, qconn quic.Connection, failPhase ChannelPhase, failErr error) {
 	chanCfg := *tm.cfg
 	chanCfg.BaleAccessToken = tp.ClientToken
 	chanCfg.BaleTargetUserID = tp.TargetUserID
@@ -968,9 +993,10 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	mainLog.Info("[%s] Connecting to Bale WS...", label)
 	client := bale.NewClient(tp.ClientToken)
 	if err := client.Connect(); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Bale connection failed: "+err.Error())
+		errStr := "Bale connection failed: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] Bale connect: %v", label, err)
-		return nil, nil
+		return nil, nil, PhaseBaleConnect, fmt.Errorf("%w", err)
 	}
 	client.StartPingLoop()
 
@@ -981,20 +1007,22 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	tm.setChannelPhase(idx, PhaseCalling, "")
 	mainLog.Info("[%s] Calling user %d...", label, tp.TargetUserID)
 	if err := client.StartCall(tp.TargetUserID, true); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Failed to start call: "+err.Error())
+		errStr := "Failed to start call: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] StartCall: %v", label, err)
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseCalling, fmt.Errorf("%w", err)
 	}
 
 	tm.setChannelPhase(idx, PhaseWaitAccept, "")
 	mainLog.Info("[%s] Waiting for server to accept (60s)...", label)
 	result, err := client.WaitForAccept(60 * time.Second)
 	if err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Server did not accept call: "+err.Error())
+		errStr := "Server did not accept call: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] WaitForAccept: %v", label, err)
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseWaitAccept, fmt.Errorf("%w", err)
 	}
 
 	wssURL := result.WssURL
@@ -1009,10 +1037,11 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	mainLog.Info("[%s] Connecting to SFU...", label)
 	sfu := lk.NewSFUTransport(&chanCfg, tm.obfuscator)
 	if err := sfu.Connect(ctx); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "SFU connection failed: "+err.Error())
+		errStr := "SFU connection failed: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] SFU connect: %v", label, err)
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseSFUConnect, fmt.Errorf("%w", err)
 	}
 
 	tm.setChannelPhase(idx, PhaseWaitTrack, "")
@@ -1020,11 +1049,12 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
 	if err := sfu.WaitForConnection(connCtx); err != nil {
 		connCancel()
-		tm.setChannelPhase(idx, PhaseError, "Timed out waiting for server media track: "+err.Error())
+		errStr := "Timed out waiting for server media track: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] Connection timeout: %v", label, err)
 		sfu.Close()
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseWaitTrack, fmt.Errorf("%w", err)
 	}
 	connCancel()
 
@@ -1035,17 +1065,20 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	// Without this wait, we may call quic.Dial() before the server is listening.
 	select {
 	case <-ctx.Done():
-		return nil, nil
+		sfu.Close()
+		client.Close()
+		return nil, nil, PhaseTunnelSetup, fmt.Errorf("cancelled during setup pause")
 	case <-time.After(1500 * time.Millisecond):
 	}
 
 	rtpConn := sfu.GetRTPConn()
 	if rtpConn == nil {
-		tm.setChannelPhase(idx, PhaseError, "RTP connection not ready (SFU not in Opus mode)")
+		errStr := "RTP connection not ready (SFU not in Opus mode)"
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] GetRTPConn returned nil", label)
 		sfu.Close()
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseTunnelSetup, fmt.Errorf("%s", errStr)
 	}
 
 	// Build OpusPacketConn: bridges quic-go to the 20ms-paced Opus RTP track
@@ -1058,30 +1091,31 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		initPktSize = 1100
 	}
 	quicCfg := &quic.Config{
-		InitialPacketSize:               initPktSize,
-		MaxIdleTimeout:                  30 * time.Second,
-		KeepAlivePeriod:                 10 * time.Second,
-		MaxIncomingStreams:              10000, // prevent stream-credit exhaustion
-		MaxIncomingUniStreams:           10000,
-		InitialStreamReceiveWindow:      2 * 1024 * 1024,
-		MaxStreamReceiveWindow:          16 * 1024 * 1024,
-		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
-		DisablePathMTUDiscovery:         true,
+		InitialPacketSize:              initPktSize,
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		MaxIncomingStreams:             10000, // prevent stream-credit exhaustion
+		MaxIncomingUniStreams:          10000,
+		InitialStreamReceiveWindow:     2 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		DisablePathMTUDiscovery:        true,
 	}
 
 	mainLog.Info("[%s] Dialing QUIC over Opus track (MTU=1100, PMTUD off)...", label)
-	qconn, err := quic.Dial(ctx, opusPC, quicconn.RemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
+	qconn, err = quic.Dial(ctx, opusPC, quicconn.RemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
 	if err != nil {
-		tm.setChannelPhase(idx, PhaseError, "QUIC dial failed: "+err.Error())
+		errStr := "QUIC dial failed: " + err.Error()
+		tm.setChannelPhase(idx, PhaseError, errStr)
 		mainLog.Info("[%s] QUIC dial: %v", label, err)
 		sfu.Close()
 		client.Close()
-		return nil, nil
+		return nil, nil, PhaseTunnelSetup, fmt.Errorf("%w", err)
 	}
 	mainLog.Info("[%s] ✅ QUIC connection established!", label)
 
-	ch := &channelState{
+	ch = &channelState{
 		index:  tp.Index,
 		label:  label,
 		client: client,
@@ -1090,7 +1124,7 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		pair:   tp,
 		qconn:  qconn,
 	}
-	return ch, qconn
+	return ch, qconn, PhaseTunnelActive, nil
 }
 
 // getLocalIPs returns all non-loopback IPv4 addresses from local network
@@ -1508,4 +1542,3 @@ func walkUpFor(filename, startDir string) string {
 	}
 	return ""
 }
-
