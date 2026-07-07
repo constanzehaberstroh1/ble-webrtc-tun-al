@@ -560,9 +560,9 @@ func (c *Client) handlePushEvent(data []byte) {
 	if len(data) > 10 {
 		readable := extractReadable(data)
 		if len(readable) > 5 {
-			baleLog.Debug("Push event (%d bytes): %s", len(data), truncStr(readable, 200))
+			baleLog.Info("Push event (%d bytes): %s", len(data), truncStr(readable, 300))
 		} else {
-			baleLog.Debug("Push event (%d bytes): hex=%x", len(data), data[:min(len(data), 100)])
+			baleLog.Info("Push event (%d bytes): hex=%x", len(data), data[:min(len(data), 120)])
 		}
 	}
 }
