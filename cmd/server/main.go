@@ -61,6 +61,13 @@ func main() {
 
 	os.Setenv("ROLE", "server")
 
+	// Fetch the live app_version (and API key) from Bale's JS bundle.
+	// Bale silently stops delivering push events (text messages, incoming calls)
+	// to clients whose app_version metadata is too old — even though the
+	// WebSocket connection stays open and pong frames keep arriving.
+	// This call updates the global before any bale.Client is created.
+	bale.FetchAndUpdateClientMeta()
+
 	cfg, err := config.Load()
 	if err != nil {
 		mainLog.Fatal("Failed to load config: %v", err)

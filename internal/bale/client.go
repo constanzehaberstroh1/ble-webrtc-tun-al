@@ -1241,8 +1241,12 @@ func buildRPCMessage(service, method string, request []byte, seq uint32) []byte 
 }
 
 func buildMetadata() []byte {
+	appVersionMu.RLock()
+	currentVersion := appVersion
+	appVersionMu.RUnlock()
+
 	pairs := [][2]string{
-		{"app_version", "154014"},
+		{"app_version", currentVersion},
 		{"browser_type", "1"},
 		{"browser_version", "138.0.0.0"},
 		{"os_type", "4"},

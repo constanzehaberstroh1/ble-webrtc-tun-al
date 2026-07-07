@@ -14,11 +14,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/salman/ble-webrtc-tun/internal/logger"
 )
 
 var (
 	baleGRPCBase = "https://next-ws.bale.ai"
+
+	// appVersion is sent in every RPC metadata frame.
+	// Bale silently stops delivering push events to clients whose version is
+	// too old — even though the WebSocket stays connected and pongs keep coming.
+	// This variable is refreshed at startup by FetchAndUpdateClientMeta().
 	appVersion   = "154014"
+	appVersionMu sync.RWMutex
 
 	baleWebApiKey   = "C28D46DC4C3A7A26564BFCC48B929086A95C93C98E789A19847BEE8627DE4E7D"
 	baleWebApiKeyMu sync.RWMutex
@@ -128,6 +136,94 @@ func fetchLatestAPIKey(httpClient *http.Client) (string, error) {
 	}
 
 	return keyMatches[1], nil
+}
+
+// fetchLatestAppVersion fetches the current app_version from Bale's JS bundle.
+// Bale uses a 6-digit integer (e.g. "154014") that they increment on each
+// release. Clients with a stale version still connect and receive pongs, but
+// Bale's gateway silently stops delivering push events (messages, calls).
+//
+// The version appears in the bundle as: appVersion:"154014" or APP_VERSION="154014"
+func fetchLatestAppVersion(httpClient *http.Client) (string, error) {
+	// 1. Fetch main page to find current JS bundle path.
+	resp, err := httpClient.Get("https://web.bale.ai/")
+	if err != nil {
+		return "", fmt.Errorf("fetch main page: %w", err)
+	}
+	defer resp.Body.Close()
+	htmlBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	htmlStr := string(htmlBytes)
+
+	// 2. Find the main JS bundle.
+	re := regexp.MustCompile(`src="(/static/js/index\.[a-f0-9]+\.js)"`)
+	matches := re.FindStringSubmatch(htmlStr)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("JS bundle not found in HTML")
+	}
+
+	// 3. Fetch the JS bundle.
+	jsURL := "https://web.bale.ai" + matches[1]
+	jsResp, err := httpClient.Get(jsURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch JS bundle: %w", err)
+	}
+	defer jsResp.Body.Close()
+	jsBytes, err := io.ReadAll(jsResp.Body)
+	if err != nil {
+		return "", err
+	}
+	jsStr := string(jsBytes)
+
+	// 4. Extract app_version. The bundle contains patterns like:
+	//    appVersion:"154014"   APP_VERSION:"154014"   "app_version","154014"
+	//    version:154014        appVersion=154014
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`[Aa]pp[Vv]ersion[:\s=]+["']?(\d{5,7})["']?`),
+		regexp.MustCompile(`APP_VERSION[:\s=]+["']?(\d{5,7})["']?`),
+		regexp.MustCompile(`"app_version"\s*,\s*"(\d{5,7})"`),
+		regexp.MustCompile(`"app_version":(\d{5,7})`),
+	}
+	for _, pat := range patterns {
+		if m := pat.FindStringSubmatch(jsStr); len(m) >= 2 {
+			return m[1], nil
+		}
+	}
+	return "", fmt.Errorf("app_version not found in JS bundle (url=%s)", jsURL)
+}
+
+// FetchAndUpdateClientMeta fetches the latest app_version (and API key) from
+// Bale's live JS bundle and updates the in-process globals.
+// Call this once at server/client startup before creating any Client instances.
+// On failure the hardcoded fallback values remain in use.
+func FetchAndUpdateClientMeta() {
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+
+	// ── App version ────────────────────────────────────────────────────────
+	if ver, err := fetchLatestAppVersion(httpClient); err != nil {
+		var curVer string
+		appVersionMu.RLock()
+		curVer = appVersion
+		appVersionMu.RUnlock()
+		var log = logger.New("bale-auth")
+		log.Warn("Could not fetch live app_version (%v) — using fallback %s", err, curVer)
+	} else {
+		appVersionMu.Lock()
+		old := appVersion
+		appVersion = ver
+		appVersionMu.Unlock()
+		var log = logger.New("bale-auth")
+		log.Info("app_version updated: %s → %s", old, ver)
+	}
+
+	// ── API key ────────────────────────────────────────────────────────────
+	if key, err := fetchLatestAPIKey(httpClient); err == nil {
+		baleWebApiKeyMu.Lock()
+		baleWebApiKey = key
+		baleWebApiKeyMu.Unlock()
+	}
 }
 
 // StartPhoneAuth sends an OTP SMS to the given phone number.
