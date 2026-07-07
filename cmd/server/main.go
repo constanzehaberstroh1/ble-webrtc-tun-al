@@ -32,12 +32,18 @@ import (
 
 // Global references for the new DB-driven system
 var (
-	accountMgr     *accounts.Manager
-	callRouter     *router.Router
-	serverDB       *db.Database
-	serverObf      *dcconn.Obfuscator // shared obfuscator for all channels
+	accountMgr *accounts.Manager
+	callRouter *router.Router
+	serverDB   *db.Database
+	serverObf  *dcconn.Obfuscator // shared obfuscator for all channels
 
-	mainLog        = logger.New("main")
+	// bondRegistry coordinates multi-lane bonding across all server accounts.
+	// Each client's N WebRTC channels (one per Bale account pair) are aggregated
+	// into one BondedPacketConn per bond group ID so the master QUIC listener
+	// can serve all N lanes with a single connection.
+	globalBondRegistry = newBondRegistry()
+
+	mainLog = logger.New("main")
 )
 
 func main() {
@@ -696,50 +702,60 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		return
 	}
 
-	opusPC := quicconn.NewServer(rtpConn)
 	tlsCfg, err := quicconn.ServerTLSConfig()
 	if err != nil {
 		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	// InitialPacketSize=1140 when obfuscation is off (full MTU reclaimed).
-	// Falls back to 1100 if obfuscation is on (reserves 40 bytes for XChaCha20).
-	initPktSize := uint16(1140)
+	// InitialPacketSize=1136 in bonded mode (1140 - 4 bytes bond header).
+	// Falls back to 1096 if obfuscation is on (reserves 40 bytes for XChaCha20).
+	initPktSize := uint16(1136)
 	if serverObf != nil && serverObf.Enabled() {
-		initPktSize = 1100
+		initPktSize = 1096
 	}
+	// BBR-style window tuning: large receive windows prevent Cubic's window-halving
+	// from throttling throughput when firewall-induced drops occur on lossy lines.
+	// The bonded 5-lane transport can deliver up to 5× single-lane bandwidth;
+	// QUIC must have windows large enough to keep all lanes saturated.
 	quicCfg := &quic.Config{
 		InitialPacketSize:               initPktSize,
 		MaxIdleTimeout:                  30 * time.Second,
-		KeepAlivePeriod:                 5 * time.Second,  // aggressive: detect dead ICE fast
-		MaxIncomingStreams:              10000,             // prevent stream-credit exhaustion
+		KeepAlivePeriod:                 5 * time.Second,   // aggressive: detect dead ICE fast
+		MaxIncomingStreams:              10000,
 		MaxIncomingUniStreams:           10000,
-		InitialStreamReceiveWindow:      2 * 1024 * 1024,
-		MaxStreamReceiveWindow:          8 * 1024 * 1024,
-		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
+		InitialStreamReceiveWindow:      4 * 1024 * 1024,   // 4MB (was 2MB)
+		MaxStreamReceiveWindow:          32 * 1024 * 1024,  // 32MB (was 8MB)
+		InitialConnectionReceiveWindow:  8 * 1024 * 1024,   // 8MB (was 4MB)
+		MaxConnectionReceiveWindow:      64 * 1024 * 1024,  // 64MB (was 16MB) — 5-lane aggregate
 		DisablePathMTUDiscovery:         true,
 	}
 
-	listener, err := quic.Listen(opusPC, tlsCfg, quicCfg)
-	if err != nil {
-		adminPanel.AddLog("error", tag+" QUIC listen failed: "+err.Error())
-		return
-	}
-	defer listener.Close()
-	mainLog.Info("%s QUIC listener ready", tag)
+	// ── Bonded mode: register this lane with the BondRegistry ───────────────────
+	// The registry collects all rtpconn.Conn instances belonging to the same
+	// client bond group and assembles them into one BondedPacketConn.
+	// The first lane to arrive starts the QUIC listener; subsequent lanes
+	// hot-join the bond, increasing available bandwidth instantly.
+	//
+	// Bond group ID: derived from the first 4 bytes of the client's QUIC
+	// Client Hello (read from the raw packet stream). For now we use a
+	// simplified approach: every session on the same server binary shares
+	// one bond group (bondGroupID=0). For multi-client support, the client
+	// should send its bond group ID as the first datagram payload.
+	const simpleBondGroupID = uint32(0) // single-client-per-server deployment
 
-	// Accept the single QUIC connection from the client.
-	// Timeout: 60s (client waits 1.5s after WaitForConnection + ICE jitter).
-	accCtx, accCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer accCancel()
-	qconn, err := listener.Accept(accCtx)
-	if err != nil {
-		adminPanel.AddLog("error", tag+" QUIC accept timeout: "+err.Error())
+	mainLog.Info("%s Registering lane in bond group 0x%08x...", tag, simpleBondGroupID)
+	qconn, bondedPC, bondErr := globalBondRegistry.RegisterLane(
+		ctx, simpleBondGroupID, rtpConn, tag, tlsCfg, quicCfg,
+	)
+	if bondErr != nil {
+		adminPanel.AddLog("error", tag+" Bond registration failed: "+bondErr.Error())
+		mainLog.Error("%s Bond registration failed: %v", tag, bondErr)
 		return
 	}
-	mainLog.Info("%s QUIC client connected — proxy active", tag)
-	adminPanel.AddLog("info", tag+" ✅ QUIC tunnel established!")
+	_ = bondedPC // the BondedPacketConn is managed by the registry
+
+	mainLog.Info("%s Bond lane registered — QUIC client connected via bonded transport", tag)
+	adminPanel.AddLog("info", tag+" ✅ Bonded QUIC tunnel established!")
 	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
 
 	go handleQUICConn(ctx, qconn)

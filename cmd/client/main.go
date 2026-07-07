@@ -679,29 +679,41 @@ func (tm *TunnelManager) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	tm.active = true
 	tm.cancel = cancel
-	tm.pool = pool.New()
 	tm.pairCount = len(pairs)
 	tm.startedAt = time.Now()
 	tm.lastError = ""
 	tm.mode = mode
 
-	go tm.runTunnels(ctx, tm.pool, pairs)
+	// ── Bonded pool: one virtual BondedPacketConn shared across all lanes ──
+	// Each channel (rtpconn.Conn) is added as a lane; the first lane triggers
+	// a single QUIC Dial that then carries all proxy traffic.
+	bc, err := quicconn.NewBondedPacketConn()
+	if err != nil {
+		cancel()
+		tm.active = false
+		tm.lastError = "failed to create bonded conn: " + err.Error()
+		return fmt.Errorf("bonded conn: %w", err)
+	}
+	p := pool.NewBonded(bc)
+	tm.pool = p
+
+	go tm.runTunnels(ctx, p, bc, pairs)
 	return nil
 }
 
-func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.TunnelPool, pairs []config.TokenPair) {
+func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.TunnelPool, bc *quicconn.BondedPacketConn, pairs []config.TokenPair) {
 	var channels []*channelState
 	var mu sync.Mutex
 	var proxyOnce sync.Once
 
-	// === PARALLEL CONNECTION ===
-	// Dial all channels concurrently so the pool is fully populated before
-	// heavy traffic starts. Previously, sequential dialing let ch1 absorb
-	// 100% of traffic while ch2..chN were still handshaking.
-	//
-	// A 500ms stagger per index avoids hammering Bale's signaling server
-	// simultaneously, but total startup time is now ~1 channel RTT + stagger,
-	// instead of N × RTT.
+	// bondDialOnce ensures QUIC Dial happens exactly once (triggered by first connected lane).
+	var bondDialOnce sync.Once
+
+	// === PARALLEL CONNECTION — BONDED MODE ===
+	// Dial all channels concurrently. Each channel adds an rtpconn.Conn lane
+	// to the shared BondedPacketConn. The first successful lane triggers a
+	// single quic.Dial over the bonded transport. All subsequent lanes are
+	// automatically striped by the BondedPacketConn.
 	var wg sync.WaitGroup
 	for i, pair := range pairs {
 		select {
@@ -717,11 +729,10 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			label := fmt.Sprintf("ch%d", pair.Index)
 
 			// Stagger: 2s × index — lets each ICE negotiation settle before next starts.
-			// (ch1=0s, ch2=2s, ch3=4s, ch4=6s, ch5=8s — still 4x faster than sequential)
 			if i > 0 {
 				tm.setChannelPhase(i, PhaseInit, "")
 				stagger := time.Duration(i) * 2 * time.Second
-				mainLog.Info("[%s] 🕐 Stagger %.0fs (parallel dial)...", label, stagger.Seconds())
+				mainLog.Info("[%s] 🕐 Stagger %.0fs (bonded parallel dial)...", label, stagger.Seconds())
 				select {
 				case <-ctx.Done():
 					return
@@ -730,31 +741,43 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			}
 
 			tm.setChannelPhase(i, PhaseBaleConnect, "")
-			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (parallel)...", label, i+1, len(pairs))
+			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (bonded mode)...", label, i+1, len(pairs))
 
-			// Layer 1+2: initChannelWithRetry classifies failures and runs the
-			// Clean Hangup Protocol (ENDCALL) against the paired server before
-			// each retry, looping until the channel connects or the credential is
-			// deemed permanently invalid.
+			// initChannelWithRetry now returns a bonded channel (qconn is the
+			// master QUIC conn shared across all lanes, set by the first lane).
 			ch, qconn := tm.initChannelWithRetry(ctx, i, pair, label)
 			if ch == nil || qconn == nil {
 				mainLog.Warn("[%s] ❌ Channel init failed (giving up)", label)
-				// PhaseError already set by initChannelWithRetry
 				return
 			}
 
+			// Register the lane's rtpconn into the shared bond.
+			if ch.sfu != nil {
+				rtpC := ch.sfu.GetRTPConn()
+				if rtpC != nil {
+					tunnelPool.AddLane(rtpC, label)
+					mainLog.Info("[%s] 🔗 Lane added to bond (%d total lanes)", label, tunnelPool.LaneCount())
+				}
+			}
+
+			// First lane: dial QUIC once over the shared BondedPacketConn.
+			bondDialOnce.Do(func() {
+				go tm.dialBondedQUIC(ctx, tunnelPool, bc)
+			})
+
 			tm.setChannelPhase(i, PhaseTunnelActive, "")
-			tunnelPool.Add(qconn, label)
 			mu.Lock()
 			channels = append(channels, ch)
 			mu.Unlock()
-			mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
+			mainLog.Info("[%s] ✅ Lane ready! (%d lanes bonded)", label, tunnelPool.LaneCount())
 
-			// Start proxies as soon as first channel is ready
+			// Start proxies as soon as first lane is bonded and QUIC is up.
 			proxyOnce.Do(func() {
+				// Wait briefly for QUIC to establish before accepting proxy conns.
+				time.Sleep(500 * time.Millisecond)
 				go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
 				go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-				mainLog.Info(" ✅ Proxies started (first channel ready)!")
+				mainLog.Info(" ✅ Proxies started (bonded mode, first lane up)!")
 				for _, ip := range getLocalIPs() {
 					mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
 				}
@@ -1120,16 +1143,20 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
 		initPktSize = 1100
 	}
+	// BBR-style tuning: large windows prevent Cubic's window-halving from
+	// throttling the bonded transport when firewall-induced drops occur.
+	// With 5 bonded lanes the effective throughput is ~5×; the QUIC window
+	// must be large enough to saturate all lanes simultaneously.
 	quicCfg := &quic.Config{
 		InitialPacketSize:              initPktSize,
 		MaxIdleTimeout:                 30 * time.Second,
 		KeepAlivePeriod:                10 * time.Second,
-		MaxIncomingStreams:             10000, // prevent stream-credit exhaustion
+		MaxIncomingStreams:             10000,
 		MaxIncomingUniStreams:          10000,
-		InitialStreamReceiveWindow:     2 * 1024 * 1024,
-		MaxStreamReceiveWindow:         16 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,  // 4MB (was 2MB)
+		MaxStreamReceiveWindow:         32 * 1024 * 1024, // 32MB (was 16MB)
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,  // 8MB (was 4MB)
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024, // 64MB (was 16MB) — saturate 5 bonded lanes
 		DisablePathMTUDiscovery:        true,
 	}
 
@@ -1194,6 +1221,71 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		qconn:  qconn,
 	}
 	return ch, qconn, PhaseTunnelActive, nil
+}
+
+// dialBondedQUIC dials a single master QUIC connection over the BondedPacketConn.
+// Called once (via bondDialOnce) when the first WebRTC lane is ready.
+// Subsequent lanes are added to the bond transparently via AddLane().
+//
+// This is the architectural inversion: instead of one QUIC conn per lane,
+// one QUIC conn rides over ALL lanes simultaneously via packet striping.
+func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.TunnelPool, bc *quicconn.BondedPacketConn) {
+	// Build QUIC config with enlarged windows for 5-lane bonded transport.
+	initPktSize := uint16(1136) // 1140 - 4 bytes bond header overhead
+	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
+		initPktSize = 1096 // additional 40-byte XChaCha20 overhead
+	}
+	quicCfg := &quic.Config{
+		InitialPacketSize:              initPktSize,
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		MaxIncomingStreams:             10000,
+		MaxIncomingUniStreams:          10000,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         32 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		DisablePathMTUDiscovery:        true,
+	}
+
+	mainLog.Info("[Bond] Dialing master QUIC connection over bonded transport (%d lanes)...", bc.LaneCount())
+
+	dialDeadline := time.Now().Add(10 * time.Second)
+	retryDelay := 250 * time.Millisecond
+	var (
+		qconn quic.Connection
+		qErr  error
+	)
+
+	for time.Now().Before(dialDeadline) {
+		select {
+		case <-ctx.Done():
+			mainLog.Warn("[Bond] QUIC dial cancelled")
+			return
+		default:
+		}
+
+		qconn, qErr = quic.Dial(ctx, bc, quicconn.BondedRemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
+		if qErr == nil {
+			break
+		}
+
+		mainLog.Debug("[Bond] QUIC not ready yet (%v) — retrying in %v", qErr, retryDelay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryDelay):
+		}
+		retryDelay = min(retryDelay*2, 1*time.Second)
+	}
+
+	if qErr != nil {
+		mainLog.Error("[Bond] ❌ Master QUIC dial failed after retries: %v", qErr)
+		return
+	}
+
+	mainLog.Info("[Bond] ✅ Master QUIC connection established over %d bonded lanes!", bc.LaneCount())
+	tunnelPool.SetMasterConn(qconn)
 }
 
 // getLocalIPs returns all non-loopback IPv4 addresses from local network
