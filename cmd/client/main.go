@@ -799,6 +799,38 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		return
 	}
 
+	// ── CRITICAL: wait for the async master QUIC dial to resolve ─────────────
+	//
+	// In bonded mode, dialBondedQUIC is launched asynchronously via
+	// bondDialOnce.Do() while the WebRTC goroutines are still running.
+	// wg.Wait() only waits for the WebRTC goroutines — it does NOT wait for
+	// the QUIC dial goroutine.
+	//
+	// Without this wait, the sequence is:
+	//   1. All 5 WebRTC goroutines finish → wg.Wait() returns
+	//   2. ActiveCount() checks masterConn — still nil (dial in-flight)
+	//   3. ActiveCount() returns 0 (legacy path, all entries have Conn==nil)
+	//   4. active==0 → tm.Stop() → pool.CloseAll() → BondedPacketConn closed
+	//   5. dialBondedQUIC's transport is gone → QUIC dial fails
+	//   6. Server gets ENDCALL → terminates sessions (ADMIN_FORCE_KILL)
+	//
+	// WaitForMaster blocks until SetMasterConn (success) or SetMasterFailed
+	// (failure/timeout) is called by dialBondedQUIC. The 25s timeout is
+	// slightly larger than dialBondedQUIC's own 20s dialTimeout, guaranteeing
+	// we always get a definitive answer.
+	if tm.bonded {
+		mainLog.Info("[Manager] Waiting for master QUIC dial to resolve (up to 25s)...")
+		if !tunnelPool.WaitForMaster(25 * time.Second) {
+			mainLog.Error("[Manager] ❌ Master QUIC dial failed — cannot start proxy. Will retry on reconnect.")
+			tm.mu.Lock()
+			tm.lastError = "master QUIC dial failed or timed out"
+			tm.mu.Unlock()
+			tm.Stop()
+			return
+		}
+		mainLog.Info("[Manager] ✅ Master QUIC connection confirmed!")
+	}
+
 	active := tunnelPool.ActiveCount()
 	if active == 0 {
 		mainLog.Info("[Main] ❌ No channels established! Cannot start proxy.")
@@ -1281,37 +1313,22 @@ func (tm *TunnelManager) dialBondedQUIC(ctx context.Context, tunnelPool *pool.Tu
 
 	mainLog.Info("[Bond] Dialing master QUIC connection over bonded transport (%d lanes)...", bc.LaneCount())
 
-	dialDeadline := time.Now().Add(10 * time.Second)
-	retryDelay := 250 * time.Millisecond
-	var (
-		qconn quic.Connection
-		qErr  error
-	)
+	// Ensure masterDone always resolves so runTunnels' WaitForMaster unblocks,
+	// even on early return / cancellation. SetMasterConn/SetMasterFailed are
+	// idempotent (guarded by masterDoneOnce), so the defer is a safety net.
+	defer tunnelPool.SetMasterFailed()
 
-	for time.Now().Before(dialDeadline) {
-		select {
-		case <-ctx.Done():
-			mainLog.Warn("[Bond] QUIC dial cancelled")
-			return
-		default:
-		}
+	// Single dial attempt with a bounded context. QUIC retransmits its Initial
+	// internally, so re-dialing on the same BondedPacketConn is unnecessary and
+	// unsafe (reorder-buffer state). 20s gives the staggered server lanes time
+	// to register their shared listener.
+	const dialTimeout = 20 * time.Second
+	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
+	defer dialCancel()
 
-		qconn, qErr = quic.Dial(ctx, bc, quicconn.BondedRemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
-		if qErr == nil {
-			break
-		}
-
-		mainLog.Debug("[Bond] QUIC not ready yet (%v) — retrying in %v", qErr, retryDelay)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(retryDelay):
-		}
-		retryDelay = min(retryDelay*2, 1*time.Second)
-	}
-
+	qconn, qErr := quic.Dial(dialCtx, bc, quicconn.BondedRemoteAddr(), quicconn.ClientTLSConfig(), quicCfg)
 	if qErr != nil {
-		mainLog.Error("[Bond] ❌ Master QUIC dial failed after retries: %v", qErr)
+		mainLog.Error("[Bond] ❌ Master QUIC dial failed: %v", qErr)
 		return
 	}
 

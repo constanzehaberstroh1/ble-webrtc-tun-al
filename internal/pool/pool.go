@@ -72,6 +72,14 @@ type TunnelPool struct {
 	masterConn quic.Connection             // single QUIC conn over bondConn
 	masterMu   sync.RWMutex
 	masterFail atomic.Int32 // consecutive stream failures on master conn
+
+	// masterDone is closed exactly once when the master QUIC dial resolves
+	// (success via SetMasterConn, or failure via SetMasterFailed). It lets
+	// runTunnels wait for the async dial before deciding to keep the tunnel up
+	// — without it, runTunnels sees ActiveCount()==0 while the dial is still
+	// in flight and tears everything down (the "No channels established" race).
+	masterDone     chan struct{}
+	masterDoneOnce sync.Once
 }
 
 // PoolEntry wraps metadata for one WebRTC lane (not one QUIC connection).
@@ -95,8 +103,9 @@ func New() *TunnelPool {
 // Call SetMasterConn after QUIC Dial/Listen has established the connection.
 func NewBonded(bc *quicconn.BondedPacketConn) *TunnelPool {
 	p := &TunnelPool{
-		done:     make(chan struct{}),
-		bondConn: bc,
+		done:       make(chan struct{}),
+		bondConn:   bc,
+		masterDone: make(chan struct{}),
 	}
 	go p.healthMonitorLoop()
 	return p
@@ -116,7 +125,34 @@ func (p *TunnelPool) SetMasterConn(conn quic.Connection) {
 	p.masterConn = conn
 	p.masterFail.Store(0)
 	p.masterMu.Unlock()
+	p.masterDoneOnce.Do(func() { close(p.masterDone) })
 	poolLog.Info("[BondedPool] Master QUIC connection registered")
+}
+
+// SetMasterFailed signals that the master QUIC dial has failed, so waiters
+// on WaitForMaster unblock and runTunnels can tear down cleanly. Idempotent.
+func (p *TunnelPool) SetMasterFailed() {
+	p.masterDoneOnce.Do(func() { close(p.masterDone) })
+}
+
+// WaitForMaster blocks until the master QUIC dial resolves (success or
+// failure) or the timeout elapses. Returns true if a master connection is
+// available. Used by runTunnels to avoid tearing down while the async dial
+// is still in flight.
+func (p *TunnelPool) WaitForMaster(timeout time.Duration) bool {
+	p.masterMu.RLock()
+	done := p.masterDone
+	p.masterMu.RUnlock()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	p.masterMu.RLock()
+	ok := p.masterConn != nil
+	p.masterMu.RUnlock()
+	return ok
 }
 
 // AddLane registers a new rtpconn.Conn lane into the BondedPacketConn and
