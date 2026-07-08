@@ -37,12 +37,6 @@ var (
 	serverDB   *db.Database
 	serverObf  *dcconn.Obfuscator // shared obfuscator for all channels
 
-	// bondRegistry coordinates multi-lane bonding across all server accounts.
-	// Each client's N WebRTC channels (one per Bale account pair) are aggregated
-	// into one BondedPacketConn per bond group ID so the master QUIC listener
-	// can serve all N lanes with a single connection.
-	globalBondRegistry = newBondRegistry()
-
 	mainLog = logger.New("main")
 )
 
@@ -702,7 +696,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		s.TunnelActive = true
 	})
 
-	// Setup QUIC server over the Opus RTP track
+	// Setup independent QUIC server over this lane's Opus RTP track
 	rtpConn := sfu.GetRTPConn()
 	if rtpConn == nil {
 		adminPanel.AddLog("error", tag+" RTP connection not ready")
@@ -714,69 +708,55 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	// InitialPacketSize is clamped to 950 bytes to match the client.
-	// The meet-gwbm*.ble.ir VoIP media gateways silently drop UDP payloads
-	// exceeding ~1100 bytes. The QUIC handshake packets (Initial, Handshake)
-	// must fit within this limit or the TLS handshake times out. 950 provides
-	// a safe margin for the 5-byte bond header and obfuscation overhead in all
-	// combinations, and must be identical on client and server.
-	const initPktSize = uint16(950)
 
-	// BBR-style window tuning: large receive windows prevent Cubic's window-halving
-	// from throttling throughput when firewall-induced drops occur on lossy lines.
-	// The bonded 5-lane transport can deliver up to 5× single-lane bandwidth;
-	// QUIC must have windows large enough to keep all lanes saturated.
+	// Create a dedicated OpusPacketConn for this lane's QUIC server.
+	opusPacketInterface := quicconn.NewServer(rtpConn)
+
 	quicCfg := &quic.Config{
-		InitialPacketSize:               initPktSize,
-		MaxIdleTimeout:                  30 * time.Second,
-		KeepAlivePeriod:                 5 * time.Second,   // aggressive: detect dead ICE fast
+		InitialPacketSize:               1140,
+		MaxIdleTimeout:                  45 * time.Second,
+		KeepAlivePeriod:                 10 * time.Second,
 		MaxIncomingStreams:              10000,
 		MaxIncomingUniStreams:           10000,
-		InitialStreamReceiveWindow:      4 * 1024 * 1024,   // 4MB (was 2MB)
-		MaxStreamReceiveWindow:          32 * 1024 * 1024,  // 32MB (was 8MB)
-		InitialConnectionReceiveWindow:  8 * 1024 * 1024,   // 8MB (was 4MB)
-		MaxConnectionReceiveWindow:      64 * 1024 * 1024,  // 64MB (was 16MB) — 5-lane aggregate
+		InitialStreamReceiveWindow:      4 * 1024 * 1024,
+		MaxStreamReceiveWindow:          32 * 1024 * 1024,
+		InitialConnectionReceiveWindow:  8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      64 * 1024 * 1024,
 		DisablePathMTUDiscovery:         true,
-		// EnableDatagrams enables RFC 9221 QUIC datagrams (must match client).
-		EnableDatagrams:                 true,
 	}
 
-	// ── Bonded mode: register this lane with the BondRegistry ───────────────────
-	// The registry collects all rtpconn.Conn instances belonging to the same
-	// client bond group and assembles them into one BondedPacketConn.
-	// The first lane to arrive starts the QUIC listener; subsequent lanes
-	// hot-join the bond, increasing available bandwidth instantly.
-	//
-	// Bond group ID: derived from the first 4 bytes of the client's QUIC
-	// Client Hello (read from the raw packet stream). For now we use a
-	// simplified approach: every session on the same server binary shares
-	// one bond group (bondGroupID=0). For multi-client support, the client
-	// should send its bond group ID as the first datagram payload.
-	const simpleBondGroupID = uint32(0) // single-client-per-server deployment
-
-	mainLog.Info("%s Registering lane in bond group 0x%08x...", tag, simpleBondGroupID)
-	qconn, bondedPC, bondErr := globalBondRegistry.RegisterLane(
-		ctx, simpleBondGroupID, rtpConn, tag, tlsCfg, quicCfg,
-	)
-	if bondErr != nil {
-		adminPanel.AddLog("error", tag+" Bond registration failed: "+bondErr.Error())
-		mainLog.Error("%s Bond registration failed: %v", tag, bondErr)
-		// Clean up this lane so stale rtpconns don't accumulate in the bond.
-		globalBondRegistry.RemoveLane(simpleBondGroupID, rtpConn)
+	// Host a dedicated QUIC server instance strictly for this channel pair.
+	mainLog.Info("%s Starting independent QUIC listener for this lane...", tag)
+	listener, err := quic.Listen(opusPacketInterface, tlsCfg, quicCfg)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC listen failed: "+err.Error())
+		mainLog.Error("%s QUIC listen failed: %v", tag, err)
 		return
 	}
-	_ = bondedPC // the BondedPacketConn is managed by the registry
+	defer listener.Close()
 
-	mainLog.Info("%s Bond lane registered — QUIC client connected via bonded transport", tag)
-	adminPanel.AddLog("info", tag+" ✅ Bonded QUIC tunnel established!")
+	// Accept the client's QUIC connection (with timeout).
+	const acceptTimeout = 90 * time.Second
+	accCtx, accCancel := context.WithTimeout(ctx, acceptTimeout)
+	defer accCancel()
+
+	qconn, err := listener.Accept(accCtx)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC accept failed: "+err.Error())
+		mainLog.Error("%s QUIC accept failed: %v", tag, err)
+		return
+	}
+
+	mainLog.Info("%s ✅ Independent QUIC connection established for this lane!", tag)
+	adminPanel.AddLog("info", tag+" ✅ Independent QUIC tunnel established!")
 	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
 
+	// Asynchronously handle incoming proxy stream requests.
 	go handleQUICConn(ctx, qconn)
 
 	// Monitor
 	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
-	// These get buffered in Bale chat and would immediately kill the new session
-drainLoop:
+	drainLoop:
 	for {
 		select {
 		case msg := <-baleClient.TextMsgCh:
@@ -787,8 +767,6 @@ drainLoop:
 	}
 
 	// Grace period: ignore BLETUN:END for 10s after session start.
-	// Bale replays unread messages from chat history which may include
-	// old END messages from previous --disconnect runs.
 	sessionStart := time.Now()
 	gracePeriod := 10 * time.Second
 
@@ -809,25 +787,15 @@ drainLoop:
 				mainLog.Info("%s Client sent BLETUN:END", tag)
 				return
 			}
-			// Handle ENDCALL command — client requests server to end active call
-			// Send ACK immediately, then return to trigger the goroutine's cleanup
-			// (DiscardCall + router EndCall + CleanupMessages) which properly ends
-			// the Bale call and updates the server UI/router state.
 			if msg == "BLETUN:ENDCALL" {
 				mainLog.Info("%s 📴 Received ENDCALL command — ending active call", tag)
 				adminPanel.AddLog("info", tag+" 📴 ENDCALL received — ending call and sending ACK")
-				// Send acknowledgment to the client BEFORE returning
 				if callerID != 0 {
 					baleClient.SendTextMessage(callerID, "BLETUN:ENDCALL_ACK")
 				}
-				// Don't call CleanupMessages here — the goroutine cleanup after
-				// handleSFUProxy returns will handle DiscardCall (ends Bale call),
-				// callRouter.EndCall (updates server UI/router), and CleanupMessages.
 				return
 			}
-			// Handle terminal relay messages (BLECMD, BLERSZ, BLEEND)
 			if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-				// Terminal relay removed — commands now go via VPN proxy
 				continue
 			}
 		case <-ticker.C:

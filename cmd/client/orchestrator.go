@@ -230,11 +230,7 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 		}
 
 		ch, qconn, failPhase, failErr := tm.initChannelTracked(ctx, idx, tp, label)
-		// In bonded mode initChannelTracked returns a non-nil ch with qconn==nil
-		// (the master QUIC conn is shared and dialed separately). Only ch is
-		// required there; requiring qconn!=nil would treat every bonded success
-		// as a failure and loop forever (re-dialing the SFU each time).
-		if ch != nil && (qconn != nil || tm.bonded) {
+		if ch != nil && qconn != nil {
 			return ch, qconn
 		}
 
@@ -286,7 +282,7 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 //   - Layer 3 scheduled refresh (healthy rotation)
 //
 // It removes the QUIC connection from the routing pool (so traffic flows over
-// surviving channels), tears down Bale/SFU/QUIC, runs the Clean Hangup Protocol
+// surviving connections), tears down Bale/SFU/QUIC, runs the Clean Hangup Protocol
 // against the paired server, then re-dials via initChannelWithRetry.
 //
 // Results are written back through the pointer receivers so the caller's
@@ -302,31 +298,16 @@ func (tm *TunnelManager) refreshChannel(
 	mu *sync.Mutex,
 	channels *[]*channelState,
 ) {
-	// 1. Drop the QUIC connection from the routing pool FIRST so the
+	// 1. Unregister the QUIC connection from the pool FIRST so the
 	//    round-robin balancer immediately steers traffic to other channels.
-	//
-	// FIX (Hole 1 — Graceful Traffic Drain):
-	// Remove from pool first to block new stream assignments, then wait 3s
-	// for in-flight bytes on active multiplexed streams to finish flushing
-	// before issuing the hard CloseWithError. Without the drain window,
-	// active downloads or long-lived API requests are killed mid-transfer.
 	if *curQ != nil {
-		tunnelPool.Remove(*curQ)
+		tunnelPool.Unregister(label)
 		time.Sleep(3 * time.Second) // allow active streams to drain
 		(*curQ).CloseWithError(0, "refresh/reconnect")
 		*curQ = nil
 	}
 
 	// 2. Tear down the old Bale/SFU/QUIC stack.
-	//
-	// FIX (Hole 2 — Token Collision): capture the active Bale client BEFORE
-	// closing the channel so we can pass it to endCallForPair below, avoiding
-	// a duplicate login with the same token while the main connection is still
-	// technically alive on the server side.
-	//
-	// FIX (Hole 4 — Slice Mutation): build a new slice instead of in-place
-	// truncation to avoid backing-array aliasing when other goroutines hold
-	// a snapshot of the old slice header.
 	var activeBaleClient *bale.Client
 	if *curCh != nil {
 		old := *curCh
@@ -335,8 +316,6 @@ func (tm *TunnelManager) refreshChannel(
 		go old.client.CleanupMessages()
 		time.Sleep(200 * time.Millisecond)
 		old.sfu.Close()
-		// Note: old.client is closed below, AFTER endCallForPair has finished
-		// using it. Do NOT call old.client.Close() here.
 
 		mu.Lock()
 		newSlice := make([]*channelState, 0, len(*channels))
@@ -351,38 +330,27 @@ func (tm *TunnelManager) refreshChannel(
 	}
 
 	// 3. Layer 2: Clean Hangup Protocol — force the paired server to IDLE.
-	//    Pass activeBaleClient so the existing session is reused if healthy
-	//    (scheduled refresh path), or nil to create a transient one (dead path).
 	tm.setChannelPhase(idx, PhaseTeardown, "clean hangup of paired server")
 	tm.endCallForPair(ctx, tp, label, activeBaleClient)
 
-	// Now safe to close the old Bale client — endCallForPair is done with it.
+	// Now safe to close the old Bale client.
 	if activeBaleClient != nil {
 		activeBaleClient.Close()
 		activeBaleClient = nil
 	}
 
-	// 4. Re-dial with Layer 1+2 retry (ENDCALL on any further call-phase fail).
+	// 4. Re-dial with Layer 1+2 retry.
 	tm.setChannelPhase(idx, PhaseBaleConnect, "")
 	newCh, newQConn := tm.initChannelWithRetry(ctx, idx, tp, label)
 	if newCh == nil {
-		// In bonded mode newQConn is intentionally nil (master QUIC is shared),
-		// so only newCh is required. A nil newCh is a fatal reconnect failure.
 		tm.setChannelPhase(idx, PhaseError, "reconnect yielded no channel — giving up")
 		return
 	}
 
 	tm.setChannelPhase(idx, PhaseTunnelActive, "")
-	if tm.bonded {
-		// Re-register the refreshed lane's rtpconn with the shared bond.
-		if newCh.sfu != nil {
-			if rtpC := newCh.sfu.GetRTPConn(); rtpC != nil {
-				tunnelPool.AddLane(rtpC, label)
-				mainLog.Info("[%s] Bonded lane re-registered after refresh", label)
-			}
-		}
-	} else {
-		tunnelPool.Add(newQConn, label)
+	// Register the new independent QUIC connection into the pool.
+	if newQConn != nil {
+		tunnelPool.Register(label, newQConn)
 	}
 	mu.Lock()
 	*channels = append(*channels, newCh)
