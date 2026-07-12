@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/salman/ble-webrtc-tun/internal/artery"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/pool"
@@ -280,6 +281,7 @@ func (tm *TunnelManager) initChannelWithRetry(ctx context.Context, idx int, tp c
 // re-establishes a fresh connection. Used by both:
 //   - Layer 2 death-reconnect (channel died unexpectedly)
 //   - Layer 3 scheduled refresh (healthy rotation)
+//   - Artery orchestrator autonomous revival
 //
 // It removes the QUIC connection from the routing pool (so traffic flows over
 // surviving connections), tears down Bale/SFU/QUIC, runs the Clean Hangup Protocol
@@ -299,7 +301,7 @@ func (tm *TunnelManager) refreshChannel(
 	channels *[]*channelState,
 ) {
 	// 1. Unregister the QUIC connection from the pool FIRST so the
-	//    round-robin balancer immediately steers traffic to other channels.
+	//    ECF scheduler immediately steers traffic to other arteries.
 	if *curQ != nil {
 		tunnelPool.Unregister(label)
 		time.Sleep(3 * time.Second) // allow active streams to drain
@@ -349,8 +351,10 @@ func (tm *TunnelManager) refreshChannel(
 
 	tm.setChannelPhase(idx, PhaseTunnelActive, "")
 	// Register the new independent QUIC connection into the pool.
+	// Use RegisterWithIndex to associate the artery with its pair index
+	// for the orchestrator's telemetry tracking.
 	if newQConn != nil {
-		tunnelPool.Register(label, newQConn)
+		tunnelPool.RegisterWithIndex(label, newQConn, idx)
 	}
 	mu.Lock()
 	*channels = append(*channels, newCh)
@@ -359,4 +363,74 @@ func (tm *TunnelManager) refreshChannel(
 	*curCh = newCh
 	*curQ = newQConn
 	mainLog.Info("[%s] ✅ Channel refreshed/reconnected", label)
+}
+
+// =============================================================================
+// Artery Orchestrator Revival Bridge
+//
+// Bridges the artery.Orchestrator's autonomous revival pipeline to the
+// TunnelManager's refreshChannel() method.  When the orchestrator detects
+// a dead/quarantined artery, it calls this function which performs the
+// full Bale WS teardown, re-auth, SFU reconnect, and QUIC re-dial.
+// =============================================================================
+
+// startArteryOrchestrator creates and starts the artery orchestrator as a
+// background goroutine.  The revival callback is wired to refreshChannel.
+func (tm *TunnelManager) startArteryOrchestrator(
+	ctx context.Context,
+	tunnelPool *pool.TunnelPool,
+	channels *[]*channelState,
+	mu *sync.Mutex,
+	pairs []config.TokenPair,
+) *artery.Orchestrator {
+	revivalFn := func(revCtx context.Context, label string, pairIndex int) {
+		mainLog.Info("[Orchestrator] Revival triggered for %s (pair=%d)", label, pairIndex)
+
+		// Find the channel state and token pair for this artery
+		mu.Lock()
+		var curCh *channelState
+		for _, ch := range *channels {
+			if ch.label == label {
+				curCh = ch
+				break
+			}
+		}
+		mu.Unlock()
+
+		// Find the token pair
+		var tp config.TokenPair
+		if pairIndex >= 0 && pairIndex < len(pairs) {
+			tp = pairs[pairIndex]
+		} else {
+			mainLog.Error("[Orchestrator] Invalid pair index %d for %s", pairIndex, label)
+			return
+		}
+
+		var curQ quic.Connection
+		if curCh != nil {
+			curQ = curCh.qconn
+		}
+
+		// Perform the full refresh (teardown + re-auth + reconnect)
+		tm.refreshChannel(revCtx, tunnelPool, &curCh, &curQ, pairIndex, tp, label, mu, channels)
+
+		// After successful revival, transition the artery to SHADOW state
+		// for stabilization.  The orchestrator's hysteresis engine will
+		// promote it to ACTIVE after 15s if metrics are good.
+		if curCh != nil && curQ != nil {
+			a := tunnelPool.GetArtery(label)
+			if a != nil {
+				// The artery was re-registered by refreshChannel as ACTIVE.
+				// Transition to SHADOW for stabilization period.
+				_ = a.TransitionTo(artery.StateShadow)
+				mainLog.Info("[Orchestrator] %s revived — in SHADOW for stabilization", label)
+			}
+		} else {
+			mainLog.Warn("[Orchestrator] Revival of %s failed — artery stays in REVIVING/DEAD", label)
+		}
+	}
+
+	orch := artery.NewOrchestrator(tunnelPool.ArteryPool(), revivalFn)
+	go orch.Start(ctx)
+	return orch
 }

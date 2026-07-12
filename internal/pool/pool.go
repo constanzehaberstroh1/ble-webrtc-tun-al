@@ -1,227 +1,133 @@
 // Package pool manages the multi-QUIC connection pool.
 //
-// Architecture (connection-level multiplexing):
+// Architecture (Autonomous Multi-Artery Orchestrator):
 //
 //   SOCKS5/HTTP proxy → pool.OpenStream()
 //                           │
 //                           ▼
-//               [ Lockless Round-Robin Selector ]
+//              [ ECF/BLEST Scheduler (latency-aware) ]
 //                           │
 //       ┌───────────┬───────┴───────┬───────────┐
 //       ▼           ▼               ▼           ▼
-//   [Lane 0]    [Lane 1]       [Lane 2]    [Lane N-1]
+//   [Artery 0]  [Artery 1]     [Artery 2]  [Artery N-1]
 //   (QUIC conn) (QUIC conn)   (QUIC conn) (QUIC conn)
+//   State:ACTIVE             State:ACTIVE
+//     SRTT:25ms   SRTT:80ms    SRTT:40ms    SRTT:120ms
+//     Loss:0%     Loss:2%      Loss:0%      Loss:5%→QUARANTINED
 //
 // Each WebRTC channel operates its own independent QUIC connection.
-// The pool distributes incoming proxy stream requests across all live
-// connections using an atomic round-robin cursor — no lock contention
-// on the hot path.
+// The pool distributes incoming proxy stream requests across all
+// ACTIVE arteries using ECF (Earliest Completion First) scheduling
+// with BLEST (Blocking Estimation) gating to avoid saturated paths.
 //
-// Circuit Breaker logic (per-connection fault isolation):
-//   - A connection with ≥3 consecutive stream failures is excluded.
-//   - After 5 failures the connection is force-closed so the
-//     TunnelManager can re-establish that specific lane.
-//   - Success resets the failure counter.
+// State Machine per artery (Asymmetric Hysteresis):
+//   ACTIVE → QUARANTINED → REVIVING → SHADOW → ACTIVE
+//   Demotion:  SRTT > 1.5× median OR loss > 5% (5s window)
+//   Promotion: SRTT within 1.2× best for 3 consecutive windows
+//   Cooldown:  30s hard lock after demotion
+//
+// The orchestrator runs three background loops:
+//   - Telemetry (500ms): EWMA RTT collection + loss tracking
+//   - Hysteresis (1s):   Demotion/promotion evaluation
+//   - Dead detection (3s): Connection liveness + revival pipeline
 package pool
 
 import (
-	"context"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/salman/ble-webrtc-tun/internal/artery"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 )
 
 var poolLog = logger.New("pool")
 
-// circuitBreakerThreshold is the number of consecutive stream open failures
-// after which a connection is excluded from load balancing.
-const circuitBreakerThreshold = int32(3)
-
-// circuitBreakerKill is the number of consecutive failures that triggers a
-// force-close of the QUIC connection, causing the TunnelManager to re-dial.
-const circuitBreakerKill = int32(5)
-
-// streamTimeout is how long OpenStreamSync waits before giving up.
-const streamTimeout = 2 * time.Second
-
 // TunnelPool manages independent QUIC connections — one per WebRTC lane.
-// OpenStream() selects a healthy connection via round-robin and opens a
+// OpenStream() selects a healthy connection via ECF scheduling and opens a
 // multiplexed QUIC stream directly over that connection.
+//
+// Internally delegates to artery.ArteryPool for intelligent scheduling.
 type TunnelPool struct {
-	mu    sync.RWMutex
-	conns map[string]*connEntry // Maps account labels to isolated QUIC sessions
-	done  chan struct{}
-	once  sync.Once
-
-	// Atomic round-robin cursor — lockless on the hot path.
-	cursor uint32
+	arteryPool *artery.ArteryPool
+	mu         sync.RWMutex
+	done       chan struct{}
+	once       sync.Once
 }
 
-// connEntry wraps a QUIC connection with health and stats metadata.
-type connEntry struct {
-	Conn          quic.Connection
-	Label         string
-	ActiveStreams  atomic.Int32
-	FailCount     atomic.Int32
-	addedAt       time.Time
-}
-
-// New creates a new empty TunnelPool with a background health monitor.
+// New creates a new empty TunnelPool backed by the artery orchestrator.
 func New() *TunnelPool {
 	p := &TunnelPool{
-		conns: make(map[string]*connEntry),
-		done:  make(chan struct{}),
+		arteryPool: artery.NewArteryPool(),
+		done:       make(chan struct{}),
 	}
-	go p.healthMonitorLoop()
+	go p.healthLogLoop()
 	return p
 }
 
+// ArteryPool returns the underlying artery pool for orchestrator integration.
+func (p *TunnelPool) ArteryPool() *artery.ArteryPool {
+	return p.arteryPool
+}
+
 // Register adds a fully-established QUIC connection to the pool under
-// the given label. The connection immediately starts carrying proxy traffic.
+// the given label. The connection immediately starts carrying proxy traffic
+// as an ACTIVE artery.
 func (p *TunnelPool) Register(label string, qconn quic.Connection) {
-	p.mu.Lock()
-	p.conns[label] = &connEntry{
-		Conn:    qconn,
-		Label:   label,
-		addedAt: time.Now(),
-	}
-	n := len(p.conns)
-	p.mu.Unlock()
-	poolLog.Info("[Pool] Registered %s (total: %d)", label, n)
+	p.arteryPool.Register(label, qconn, 0)
+	poolLog.Info("[Pool] Registered %s (total: %d)", label, p.arteryPool.TotalCount())
+}
+
+// RegisterWithIndex registers a QUIC connection with a specific pair index.
+func (p *TunnelPool) RegisterWithIndex(label string, qconn quic.Connection, pairIndex int) *artery.Artery {
+	a := p.arteryPool.Register(label, qconn, pairIndex)
+	poolLog.Info("[Pool] Registered %s (pair=%d, total: %d)", label, pairIndex, p.arteryPool.TotalCount())
+	return a
 }
 
 // Unregister removes a connection from the pool. Active proxy traffic
-// is immediately steered to remaining connections by the round-robin cursor.
+// is immediately steered to remaining arteries by the ECF scheduler.
 func (p *TunnelPool) Unregister(label string) {
-	p.mu.Lock()
-	delete(p.conns, label)
-	n := len(p.conns)
-	p.mu.Unlock()
-	poolLog.Info("[Pool] Unregistered %s (remaining: %d)", label, n)
+	p.arteryPool.Unregister(label)
 }
 
-// OpenStream opens a QUIC stream on a healthy connection selected by
-// atomic round-robin. Thread-safe and lockless on the cursor increment.
+// OpenStream opens a QUIC stream on the artery with the lowest expected
+// completion time (ECF scheduling with BLEST gating).
+// Thread-safe and backward-compatible with the original round-robin API.
 func (p *TunnelPool) OpenStream() (net.Conn, error) {
-	p.mu.RLock()
-	n := len(p.conns)
-	if n == 0 {
-		p.mu.RUnlock()
-		return nil, fmt.Errorf("zero active multiplex lines available in the pool map")
-	}
-
-	// Extract active keys under read-lock safety limits.
-	keys := make([]string, 0, n)
-	for k := range p.conns {
-		keys = append(keys, k)
-	}
-
-	// Try each connection in round-robin order, skipping unhealthy ones.
-	start := atomic.AddUint32(&p.cursor, 1)
-	var selected *connEntry
-	var selectedLabel string
-
-	for i := uint32(0); i < uint32(n); i++ {
-		idx := (start + i) % uint32(len(keys))
-		label := keys[idx]
-		entry := p.conns[label]
-
-		// Skip dead connections.
-		select {
-		case <-entry.Conn.Context().Done():
-			continue
-		default:
-		}
-
-		// Skip circuit-broken connections.
-		if entry.FailCount.Load() >= circuitBreakerThreshold {
-			continue
-		}
-
-		selected = entry
-		selectedLabel = label
-		break
-	}
-	p.mu.RUnlock()
-
-	if selected == nil {
-		return nil, fmt.Errorf("no healthy connections available")
-	}
-
-	// Open a multiplexed stream on the selected connection.
-	ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
-	defer cancel()
-
-	stream, err := selected.Conn.OpenStreamSync(ctx)
-	if err != nil {
-		newFails := selected.FailCount.Add(1)
-		poolLog.Warn("[Pool] Stream open failed on %s (fails=%d): %v", selectedLabel, newFails, err)
-		if newFails >= circuitBreakerKill {
-			poolLog.Warn("[Pool] Circuit-breaker KILL on %s — force-closing", selectedLabel)
-			selected.Conn.CloseWithError(1, "circuit breaker: stream exhaustion")
-		}
-		return nil, fmt.Errorf("open stream on %s: %w", selectedLabel, err)
-	}
-
-	// Success — reset circuit breaker.
-	if old := selected.FailCount.Swap(0); old > 0 {
-		poolLog.Info("[Pool] %s recovered (was fails=%d)", selectedLabel, old)
-	}
-	selected.ActiveStreams.Add(1)
-
-	return &trackedStream{
-		Conn:  wrapQUICStream(stream, selected.Conn),
-		entry: selected,
-	}, nil
+	return p.arteryPool.OpenStream()
 }
 
-// ActiveCount returns the number of healthy (alive) QUIC connections.
+// ActiveCount returns the number of ACTIVE arteries that are alive.
 func (p *TunnelPool) ActiveCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	count := 0
-	for _, e := range p.conns {
-		select {
-		case <-e.Conn.Context().Done():
-		default:
-			count++
-		}
-	}
-	return count
+	return p.arteryPool.ActiveCount()
 }
 
 // CloseAll closes all QUIC connections in the pool.
 func (p *TunnelPool) CloseAll() {
 	p.once.Do(func() { close(p.done) })
-
-	p.mu.Lock()
-	for label, e := range p.conns {
-		poolLog.Info("[Pool] Closing %s", label)
-		e.Conn.CloseWithError(0, "tunnel stopped")
-	}
-	p.conns = make(map[string]*connEntry)
-	p.mu.Unlock()
-
-	poolLog.Info("[Pool] All connections closed")
+	p.arteryPool.CloseAll()
 }
 
 // GetConnection returns the QUIC connection for a specific label, or nil.
 func (p *TunnelPool) GetConnection(label string) quic.Connection {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if e, ok := p.conns[label]; ok {
-		return e.Conn
-	}
-	return nil
+	return p.arteryPool.GetConnection(label)
 }
 
-// healthMonitorLoop logs pool status every 5s and evicts dead entries.
-func (p *TunnelPool) healthMonitorLoop() {
+// GetArtery returns the artery for a specific label, or nil.
+func (p *TunnelPool) GetArtery(label string) *artery.Artery {
+	return p.arteryPool.GetArtery(label)
+}
+
+// GetArteryStatuses returns health snapshots for all arteries (admin panel).
+func (p *TunnelPool) GetArteryStatuses() []artery.ArteryStatus {
+	return p.arteryPool.GetArteryStatuses()
+}
+
+// healthLogLoop logs pool status every 5s and monitors artery health.
+func (p *TunnelPool) healthLogLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -229,61 +135,31 @@ func (p *TunnelPool) healthMonitorLoop() {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			p.mu.Lock()
-			for label, e := range p.conns {
-				select {
-				case <-e.Conn.Context().Done():
-					poolLog.Warn("[Health] Evicting dead connection %s", label)
-					delete(p.conns, label)
-				default:
-					poolLog.Info("[Health] %s: alive (fails=%d, streams=%d)",
-						label, e.FailCount.Load(), e.ActiveStreams.Load())
-				}
+			active := p.arteryPool.ActiveCount()
+			total := p.arteryPool.TotalCount()
+			alive := p.arteryPool.AliveCount()
+
+			if total == 0 {
+				continue
 			}
-			p.mu.Unlock()
+
+			// Log per-artery health at INFO level
+			for _, a := range p.arteryPool.AllArteries() {
+				state := a.State()
+				srtt := a.SRTT()
+				loss := a.PacketLoss()
+				streams := a.ActiveStreams()
+				poolLog.Info("[Health] %s: state=%s srtt=%dms loss=%.1f%% streams=%d",
+					a.Label, state, srtt.Milliseconds(), loss*100, streams)
+			}
+
+			poolLog.Info("[Health] Summary: %d/%d active, %d/%d alive",
+				active, total, alive, total)
 		}
 	}
 }
 
-// ── trackedStream ─────────────────────────────────────────────────────────────
-
-type trackedStream struct {
-	net.Conn
-	entry *connEntry
-	once  sync.Once
-}
-
-func (s *trackedStream) Close() error {
-	s.once.Do(func() {
-		if s.entry != nil {
-			if s.entry.ActiveStreams.Add(-1) < 0 {
-				s.entry.ActiveStreams.Store(0)
-			}
-		}
-	})
-	return s.Conn.Close()
-}
-
-// ── quicStreamConn ────────────────────────────────────────────────────────────
-
-type quicStreamConn struct {
-	quic.Stream
-	local  net.Addr
-	remote net.Addr
-}
-
-func wrapQUICStream(s quic.Stream, conn quic.Connection) net.Conn {
-	return &quicStreamConn{
-		Stream: s,
-		local:  conn.LocalAddr(),
-		remote: conn.RemoteAddr(),
-	}
-}
-
-func (c *quicStreamConn) LocalAddr() net.Addr  { return c.local }
-func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
-
-// ── Compatibility shims ───────────────────────────────────────────────────────
+// ── Compatibility shims ───────────────────────────────────────────────
 
 // PoolEntry is kept for backward-compatibility with status reporting APIs.
 type PoolEntry struct {
@@ -299,15 +175,17 @@ func (e *PoolEntry) LatencyMs() int64 { return 0 }
 
 // Sessions returns a list of all registered connections as PoolEntry slices.
 func (p *TunnelPool) Sessions() []*PoolEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]*PoolEntry, 0, len(p.conns))
-	for _, e := range p.conns {
-		out = append(out, &PoolEntry{
-			Conn:    e.Conn,
-			Label:   e.Label,
-			addedAt: e.addedAt,
-		})
+	arteries := p.arteryPool.AllArteries()
+	out := make([]*PoolEntry, 0, len(arteries))
+	for _, a := range arteries {
+		entry := &PoolEntry{
+			Conn:    a.QConn(),
+			Label:   a.Label,
+			addedAt: time.Now(),
+		}
+		entry.ActiveStreams.Store(a.ActiveStreams())
+		entry.FailCount.Store(int32(a.PacketLoss() * 100))
+		out = append(out, entry)
 	}
 	return out
 }

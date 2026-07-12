@@ -22,6 +22,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/api"
+	"github.com/salman/ble-webrtc-tun/internal/artery"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/db"
@@ -214,18 +215,19 @@ type ChannelStatus struct {
 
 // TunnelStatus is the detailed status returned by the API.
 type TunnelStatus struct {
-	Active         bool            `json:"active"`
-	Phase          string          `json:"phase"` // overall phase
-	ClientID       string          `json:"client_id"`
-	Channels       []ChannelStatus `json:"channels"`
-	TotalChannels  int             `json:"total_channels"`
-	ActiveCount    int             `json:"active_count"`
-	TotalSent      int64           `json:"total_sent"`
-	TotalReceived  int64           `json:"total_received"`
-	StartedAt      *time.Time      `json:"started_at,omitempty"`
-	Error          string          `json:"error,omitempty"`
-	Mode           string          `json:"mode"` // "pairing" or "smart"
-	ProxyAddresses []ProxyAddress  `json:"proxy_addresses,omitempty"`
+	Active          bool                  `json:"active"`
+	Phase           string                `json:"phase"` // overall phase
+	ClientID        string                `json:"client_id"`
+	Channels        []ChannelStatus       `json:"channels"`
+	Arteries        []artery.ArteryStatus `json:"arteries,omitempty"` // Per-artery telemetry
+	TotalChannels   int                   `json:"total_channels"`
+	ActiveCount     int                   `json:"active_count"`
+	TotalSent       int64                 `json:"total_sent"`
+	TotalReceived   int64                 `json:"total_received"`
+	StartedAt       *time.Time            `json:"started_at,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	Mode            string                `json:"mode"` // "pairing" or "smart"
+	ProxyAddresses  []ProxyAddress        `json:"proxy_addresses,omitempty"`
 }
 
 // ProxyAddress represents a single proxy listener address.
@@ -262,6 +264,9 @@ type TunnelManager struct {
 
 	// Layer 3: staggered refresh coordinator (concurrency ticket + quorum lock)
 	refresh *refreshSupervisor
+
+	// Artery orchestrator (autonomous health management)
+	orchestrator *artery.Orchestrator
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -364,11 +369,20 @@ func (tm *TunnelManager) GetDetailedStatus() TunnelStatus {
 		}
 	}
 
+	// Collect artery telemetry if pool is active
+	var arteryStatuses []artery.ArteryStatus
+	tm.mu.Lock()
+	if tm.pool != nil {
+		arteryStatuses = tm.pool.GetArteryStatuses()
+	}
+	tm.mu.Unlock()
+
 	status := TunnelStatus{
 		Active:         active,
 		Phase:          overallPhase,
 		ClientID:       tm.clientID,
 		Channels:       channels,
+		Arteries:       arteryStatuses,
 		TotalChannels:  pairCount,
 		ActiveCount:    activeCount,
 		TotalSent:      totalSent,
@@ -441,6 +455,10 @@ func (tm *TunnelManager) Stop() {
 	if tm.cancel != nil {
 		tm.cancel()
 		tm.cancel = nil
+	}
+	if tm.orchestrator != nil {
+		tm.orchestrator.Stop()
+		tm.orchestrator = nil
 	}
 	if tm.pool != nil {
 		tm.pool.CloseAll()
@@ -727,10 +745,11 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 			continue
 		}
 
-		// Register this lane's independent QUIC connection into the pool.
+		// Register this lane's independent QUIC connection into the pool
+		// with its pair index for artery telemetry tracking.
 		if qconn != nil {
-			tunnelPool.Register(label, qconn)
-			mainLog.Info("[%s] ✅ Independent QUIC connection registered (pool size: %d)", label, tunnelPool.ActiveCount())
+			tunnelPool.RegisterWithIndex(label, qconn, i)
+			mainLog.Info("[%s] ✅ Independent QUIC connection registered as artery (pool size: %d)", label, tunnelPool.ActiveCount())
 		}
 
 		tm.setChannelPhase(i, PhaseTunnelActive, "")
@@ -754,7 +773,18 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		tm.Stop()
 		return
 	}
-	mainLog.Info(" 🟢 %d/%d channels active — READY", active, len(pairs))
+	mainLog.Info(" 🟢 %d/%d channels active — READY (artery orchestrator starting)", active, len(pairs))
+
+	// === Start the Artery Orchestrator ===
+	// The orchestrator runs three background loops:
+	// - Telemetry (500ms): EWMA RTT collection + loss tracking
+	// - Hysteresis (1s):   Demotion/promotion evaluation
+	// - Dead detection (3s): Connection liveness + autonomous revival
+	orch := tm.startArteryOrchestrator(ctx, tunnelPool, &channels, &mu, pairs)
+	tm.mu.Lock()
+	tm.orchestrator = orch
+	tm.mu.Unlock()
+	mainLog.Info(" 🧠 Artery orchestrator active — autonomous health management engaged")
 
 	// Start SOCKS5 / HTTP proxies once at least one QUIC connection is live.
 	proxyOnce.Do(func() {
