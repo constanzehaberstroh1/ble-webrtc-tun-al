@@ -26,6 +26,8 @@ export function SettingsPage() {
   const [panelRole, setPanelRole] = useState<string>('');
   const [serverURLs, setServerURLs] = useState<string[]>([]);
   const [remoteServerURL, setRemoteServerURL] = useState<string>('');
+  const [baleConstants, setBaleConstants] = useState<any>(null);
+  const [baleSyncing, setBaleSyncing] = useState(false);
 
   const loadSyncStatus = useCallback(async () => {
     try {
@@ -40,7 +42,31 @@ export function SettingsPage() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => { loadSyncStatus(); }, [loadSyncStatus]);
+  const loadBaleConstants = useCallback(async () => {
+    try {
+      const data = await api.getBaleConstants();
+      setBaleConstants(data);
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { loadSyncStatus(); loadBaleConstants(); }, [loadSyncStatus, loadBaleConstants]);
+
+  const handleBaleSync = async () => {
+    setBaleSyncing(true);
+    try {
+      const data = await api.syncBaleConstants();
+      if (data.status === 'success') {
+        setBaleConstants(data);
+        message.success('Bale constants synchronized from upstream');
+      } else {
+        message.error(data.message || 'Sync failed');
+      }
+    } catch (e: any) {
+      message.error(e.message || 'Failed to sync Bale constants');
+    } finally {
+      setBaleSyncing(false);
+    }
+  };
 
   const handleManualSync = async () => {
     setSyncing(true);
@@ -150,6 +176,85 @@ export function SettingsPage() {
             </Select>
           </Col>
         </Row>
+      </Card>
+
+      {/* Bale Client Constants — Dynamic Upstream Parameter Extraction */}
+      <Card
+        title={<><CloudSyncOutlined className="mr-2" />Bale Client Constants</>}
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Space>
+            <Button
+              type="primary"
+              icon={<SyncOutlined spin={baleSyncing} />}
+              loading={baleSyncing}
+              onClick={handleBaleSync}
+            >
+              Sync from Bale
+            </Button>
+          </Space>
+        }
+      >
+        <Alert
+          message="Dynamic Upstream Parameter Extraction"
+          description="Bale updates client protocol parameters with each release. Click 'Sync from Bale' to scrape the live web bundle (web.bale.ai) and hot-swap these constants — new connections immediately use the updated values without a restart."
+          type="info"
+          showIcon
+          icon={<CloudSyncOutlined />}
+          className="mb-4"
+        />
+
+        {baleConstants ? (
+          <>
+            <Descriptions column={{ xs: 1, md: 2 }} size="small" bordered>
+              <Descriptions.Item label="App Version">
+                <Tag color="blue" className="font-mono">{baleConstants.app_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit SDK Version">
+                <Tag color="geekblue" className="font-mono">{baleConstants.livekit_sdk_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit Protocol">
+                <Tag color="geekblue" className="font-mono">v{baleConstants.livekit_protocol_version || '—'}</Tag>
+                <Text type="secondary" className="ml-2 text-xs">subprotocol: lk-protocol-{baleConstants.livekit_protocol_version || '?'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Browser Version">
+                <Tag color="cyan" className="font-mono">{baleConstants.browser_version || '—'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale WS URL" span={2}>
+                <Text className="font-mono text-xs">{baleConstants.bale_ws_url || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale gRPC Base" span={2}>
+                <Text className="font-mono text-xs">{baleConstants.bale_grpc_base || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="LiveKit Origin">
+                <Text className="font-mono text-xs">{baleConstants.livekit_origin || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Bale Web Origin">
+                <Text className="font-mono text-xs">{baleConstants.bale_web_origin || '—'}</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="Web API Key" span={2}>
+                <Text className="font-mono text-xs" style={{ wordBreak: 'break-all' }}>
+                  {baleConstants.web_api_key ? `${baleConstants.web_api_key.slice(0, 12)}...${baleConstants.web_api_key.slice(-8)}` : '—'}
+                </Text>
+              </Descriptions.Item>
+            </Descriptions>
+
+            <div className="mt-3 text-xs text-slate-400">
+              <Badge
+                status={baleSyncing ? 'processing' : (baleConstants.last_synced_at ? 'success' : 'default')}
+                text={
+                  baleSyncing ? 'Extracting parameters from upstream...'
+                    : baleConstants.last_synced_at
+                      ? `Last synced: ${baleConstants.last_synced_at}`
+                      : 'Never synced — using default values'
+                }
+              />
+            </div>
+          </>
+        ) : (
+          <Text type="secondary">Loading Bale client constants...</Text>
+        )}
       </Card>
 
       {/* Server URLs */}

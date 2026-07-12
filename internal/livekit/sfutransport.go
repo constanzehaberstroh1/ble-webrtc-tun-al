@@ -5,8 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
+	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,18 +41,18 @@ type SFUTransport struct {
 	conn *websocket.Conn
 	mu   sync.RWMutex
 
-	pubPC  *webrtc.PeerConnection // publisher PC
-	subPC  *webrtc.PeerConnection // subscriber PC
-	track  *webrtc.TrackLocalStaticSample
+	pubPC *webrtc.PeerConnection // publisher PC
+	subPC *webrtc.PeerConnection // subscriber PC
+	track *webrtc.TrackLocalStaticSample
 
 	// DataChannel for tunnel data - reliable/ordered SCTP (fallback)
-	pubDC   *webrtc.DataChannel // publisher _reliable data channel
-	dcReady chan struct{}        // closed when pubDC is open
+	pubDC    *webrtc.DataChannel // publisher _reliable data channel
+	dcReady  chan struct{}       // closed when pubDC is open
 	dataConn *dcconn.Conn        // io.ReadWriteCloser for yamux (DC mode)
 
 	// RTP audio tunnel (primary — DPI evasion)
-	rtpDataConn *rtpconn.Conn    // io.ReadWriteCloser for QUIC (RTP mode)
-	useRTP      bool             // true = tunnel via Opus RTP
+	rtpDataConn *rtpconn.Conn // io.ReadWriteCloser for QUIC (RTP mode)
+	useRTP      bool          // true = tunnel via Opus RTP
 
 	// Obfuscation layer (anti-DPI)
 	obfuscator *dcconn.Obfuscator
@@ -109,11 +110,11 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false},
 		HandshakeTimeout: 15 * time.Second,
-		Subprotocols:     []string{"lk-protocol-15"},
+		Subprotocols:     []string{bale.ProtocolSubprotocol()},
 	}
 	headers := http.Header{
 		"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-		"Origin":     []string{"https://web.ble.ir"},
+		"Origin":     []string{bale.LiveKitOrigin()},
 	}
 
 	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
@@ -258,7 +259,6 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	if _, err := pc.AddTrack(track); err != nil {
 		return err
 	}
-
 
 	// No DataChannel needed — all tunnel data flows through Opus RTP.
 	// Creating a DataChannel would generate SCTP traffic detectable by DPI.
@@ -852,8 +852,8 @@ func (s *SFUTransport) buildWSURL() (string, error) {
 	q.Set("access_token", s.cfg.LiveKitToken)
 	q.Set("auto_subscribe", "1")
 	q.Set("sdk", "js")
-	q.Set("version", "2.13.6")
-	q.Set("protocol", "15")
+	q.Set("version", bale.SDKVersion())
+	q.Set("protocol", bale.ProtocolVersion())
 	q.Set("adaptive_stream", "1")
 	u.RawQuery = q.Encode()
 	return u.String(), nil

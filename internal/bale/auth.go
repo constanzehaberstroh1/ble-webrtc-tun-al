@@ -2,6 +2,7 @@ package bale
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -12,25 +13,14 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/salman/ble-webrtc-tun/internal/logger"
 )
 
-var (
-	baleGRPCBase = "https://next-ws.bale.ai"
-
-	// appVersion is sent in every RPC metadata frame.
-	// Bale silently stops delivering push events to clients whose version is
-	// too old — even though the WebSocket stays connected and pongs keep coming.
-	// This variable is refreshed at startup by FetchAndUpdateClientMeta().
-	appVersion   = "154014"
-	appVersionMu sync.RWMutex
-
-	baleWebApiKey   = "C28D46DC4C3A7A26564BFCC48B929086A95C93C98E789A19847BEE8627DE4E7D"
-	baleWebApiKeyMu sync.RWMutex
-)
+// Bale client constants (app_version, API key, browser version, gRPC base,
+// etc.) now live in the centralized constants store (constants.go) and are
+// accessed via the thread-safe getters (AppVersion(), WebAPIKey(),
+// BaleGRPCBase(), BrowserVersion(), …).  They are loaded from the database at
+// startup and can be re-extracted from the live Bale bundle via the REST API.
 
 // AuthClient handles the Bale OTP login flow via gRPC-Web.
 type AuthClient struct {
@@ -73,7 +63,7 @@ func newAuthClient(token string) *AuthClient {
 		},
 		sessionID:   fmt.Sprintf("%d", time.Now().UnixMilli()),
 		deviceUUID:  generateUUID(),
-		appVersionS: appVersion,
+		appVersionS: AppVersion(),
 		accessToken: token,
 	}
 }
@@ -195,36 +185,49 @@ func fetchLatestAppVersion(httpClient *http.Client) (string, error) {
 	return "", fmt.Errorf("app_version not found in JS bundle (url=%s)", jsURL)
 }
 
-// FetchAndUpdateClientMeta fetches the latest app_version (and API key) from
-// Bale's live JS bundle and updates the in-process globals.
+// FetchAndUpdateClientMeta fetches the latest client-emulation constants
+// (app_version, API key, LiveKit SDK/protocol versions, browser version, and
+// infrastructure URLs) from Bale's live JS bundle and updates the centralized
+// constants store.
+//
 // Call this once at server/client startup before creating any Client instances.
-// On failure the hardcoded fallback values remain in use.
+// On failure the persisted/default fallback values remain in use.
 func FetchAndUpdateClientMeta() {
-	httpClient := &http.Client{Timeout: 20 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
 
-	// ── App version ────────────────────────────────────────────────────────
-	if ver, err := fetchLatestAppVersion(httpClient); err != nil {
-		var curVer string
-		appVersionMu.RLock()
-		curVer = appVersion
-		appVersionMu.RUnlock()
-		var log = logger.New("bale-auth")
-		log.Warn("Could not fetch live app_version (%v) — using fallback %s", err, curVer)
-	} else {
-		appVersionMu.Lock()
-		old := appVersion
-		appVersion = ver
-		appVersionMu.Unlock()
-		var log = logger.New("bale-auth")
-		log.Info("app_version updated: %s → %s", old, ver)
+	// Try the comprehensive extractor first (parses all JS chunks dynamically).
+	extracted, err := ExtractConstants(ctx)
+	if err != nil {
+		baleLog.Warn("Comprehensive extraction failed (%v) — falling back to index-only scrape", err)
+		httpClient := &http.Client{Timeout: 20 * time.Second}
+		if ver, ferr := fetchLatestAppVersion(httpClient); ferr == nil {
+			SetAppVersion(ver)
+			baleLog.Info("app_version updated (fallback): %s", ver)
+		} else {
+			baleLog.Warn("Could not fetch live app_version (%v) — using fallback %s", ferr, AppVersion())
+		}
+		if key, ferr := fetchLatestAPIKey(httpClient); ferr == nil {
+			SetWebAPIKey(key)
+		}
+		return
 	}
 
-	// ── API key ────────────────────────────────────────────────────────────
-	if key, err := fetchLatestAPIKey(httpClient); err == nil {
-		baleWebApiKeyMu.Lock()
-		baleWebApiKey = key
-		baleWebApiKeyMu.Unlock()
-	}
+	// Apply all extracted values to the in-memory store.
+	ApplySnapshot(ConstantSnapshot{
+		AppVersion:      extracted.AppVersion,
+		WebAPIKey:       extracted.WebAPIKey,
+		SDKVersion:      extracted.SDKVersion,
+		ProtocolVersion: extracted.ProtocolVersion,
+		BrowserVersion:  extracted.BrowserVersion,
+		BaleWSURL:       extracted.BaleWSURL,
+		BaleGRPCBase:    extracted.BaleGRPCBase,
+		LiveKitOrigin:   extracted.LiveKitOrigin,
+		BaleWebOrigin:   extracted.BaleWebOrigin,
+	})
+
+	baleLog.Info("Client meta synced: app_version=%s sdk=%s protocol=%s browser=%s",
+		extracted.AppVersion, extracted.SDKVersion, extracted.ProtocolVersion, extracted.BrowserVersion)
 }
 
 // StartPhoneAuth sends an OTP SMS to the given phone number.
@@ -243,16 +246,14 @@ func (a *AuthClient) StartPhoneAuth(phoneNumber int64) (string, error) {
 	var err error
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		baleWebApiKeyMu.RLock()
-		currentKey := baleWebApiKey
-		baleWebApiKeyMu.RUnlock()
+		currentKey := WebAPIKey()
 
 		var msg []byte
 		msg = appendVarintField(msg, 1, uint64(phoneNumber))
 		msg = appendVarintField(msg, 2, 4) // app_id = WEB
 		msg = appendField(msg, 3, []byte(currentKey))
 		msg = appendField(msg, 4, []byte(a.deviceUUID))
-		msg = appendField(msg, 5, []byte("Chrome_138.0.0.0, Linux"))
+		msg = appendField(msg, 5, []byte(DeviceTitle()))
 		msg = appendVarintField(msg, 9, 1) // SMS
 		msg = appendField(msg, 10, []byte{0x00, 0x01})
 
@@ -268,14 +269,12 @@ func (a *AuthClient) StartPhoneAuth(phoneNumber int64) (string, error) {
 					return "", fmt.Errorf("StartPhoneAuth failed (invalid api_key) and fetch failed: %w", fetchErr)
 				}
 				baleLog.Info("Found new API key: %s", newKey)
-				baleWebApiKeyMu.Lock()
-				baleWebApiKey = newKey
-				baleWebApiKeyMu.Unlock()
+				SetWebAPIKey(newKey)
 				continue // Retry with new key
 			}
 			return "", fmt.Errorf("StartPhoneAuth request failed: %w", err)
 		}
-		
+
 		// Success! Break retry loop
 		break
 	}
@@ -387,14 +386,17 @@ func (a *AuthClient) ValidateCode(transactionHash, code string) (*AuthResult, er
 
 // doGRPCRequestFull sends a gRPC-Web POST and returns body + headers.
 func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.Header, error) {
-	url := baleGRPCBase + path
+	url := BaleGRPCBase() + path
+	ua := LinuxUserAgent()
+	origin := BaleWebOrigin()
+	chromeMajor := ChromeMajorVersion()
 
 	// Optional: Send OPTIONS preflight just like the browser
 	optionsReq, _ := http.NewRequest("OPTIONS", url, nil)
-	optionsReq.Header.Set("Origin", "https://web.bale.ai")
+	optionsReq.Header.Set("Origin", origin)
 	optionsReq.Header.Set("Access-Control-Request-Method", "POST")
 	optionsReq.Header.Set("Access-Control-Request-Headers", "app_version,browser_type,browser_version,content-type,mt_app_version,mt_browser_type,mt_browser_version,mt_os_type,mt_session_id,os_type,session_id,x-grpc-web")
-	optionsReq.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+	optionsReq.Header.Set("User-Agent", ua)
 	a.httpClient.Do(optionsReq)
 
 	baleLog.Info("Sending POST to %s with payload hex: %x", url, body)
@@ -404,16 +406,19 @@ func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.H
 		return nil, nil, err
 	}
 
+	appVer := AppVersion()
+	bv := BrowserVersion()
+
 	req.Header.Set("Content-Type", "application/grpc-web+proto")
 	req.Header.Set("x-grpc-web", "1")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-	req.Header.Set("Origin", "https://web.bale.ai")
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Origin", origin)
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
-	req.Header.Set("sec-ch-ua", `"Not)A;Brand";v="8", "Chromium";v="138"`)
+	req.Header.Set("sec-ch-ua", `"Not)A;Brand";v="8", "Chromium";v="`+chromeMajor+`"`)
 	req.Header.Set("sec-ch-ua-mobile", "?0")
 	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
 	req.Header.Set("session_id", a.sessionID)
@@ -422,10 +427,10 @@ func (a *AuthClient) doGRPCRequestFull(path string, body []byte) ([]byte, http.H
 	req.Header.Set("mt_os_type", "4")
 	req.Header.Set("browser_type", "1")
 	req.Header.Set("mt_browser_type", "1")
-	req.Header.Set("browser_version", "138.0.0.0")
-	req.Header.Set("mt_browser_version", "138.0.0.0")
-	req.Header.Set("app_version", appVersion)
-	req.Header.Set("mt_app_version", appVersion)
+	req.Header.Set("browser_version", bv)
+	req.Header.Set("mt_browser_version", bv)
+	req.Header.Set("app_version", appVer)
+	req.Header.Set("mt_app_version", appVer)
 	req.Header.Set("DNT", "1")
 	req.Header.Set("Sec-GPC", "1")
 
@@ -567,5 +572,3 @@ func generateUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
-
-

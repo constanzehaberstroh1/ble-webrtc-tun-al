@@ -18,11 +18,11 @@ var baleLog = logger.New("bale")
 
 // Client represents a connection to Bale's WebSocket.
 type Client struct {
-	token   string
-	conn    *websocket.Conn
-	mu      sync.Mutex
-	seqNum  uint32
-	seqMu   sync.Mutex
+	token  string
+	conn   *websocket.Conn
+	mu     sync.Mutex
+	seqNum uint32
+	seqMu  sync.Mutex
 
 	// RPC response channel for synchronous calls
 	rpcRespCh chan []byte
@@ -362,15 +362,15 @@ func (c *Client) DrainTextChannels() {
 // Connect establishes the WebSocket connection.
 func (c *Client) Connect() error {
 	headers := http.Header{}
-	headers.Set("Origin", "https://web.bale.ai")
-	headers.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+	headers.Set("Origin", BaleWebOrigin())
+	headers.Set("User-Agent", LinuxUserAgent())
 	headers.Set("Cookie", "access_token="+c.token)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 	}
 
-	conn, _, err := dialer.Dial("wss://next-ws.bale.ai/ws/", headers)
+	conn, _, err := dialer.Dial(BaleWSURL(), headers)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -775,6 +775,7 @@ func (c *Client) DeleteMessage(peerID int64, messageID int64, dateMs int64) erro
 	baleLog.Info("DeleteMessage peer=%d msgId=%d (seq=%d)", peerID, messageID, seq)
 	return c.send(msg)
 }
+
 // ClearChat sends the ClearChat RPC to delete ALL messages in a chat with a peer.
 // This wipes the entire chat history, not just tracked messages.
 func (c *Client) ClearChat(peerID int64) error {
@@ -925,7 +926,7 @@ func (c *Client) trackIncomingMessageFromPush(data []byte) {
 	// Push messages have the message data deeply nested.
 	// We look for patterns: a varint that looks like a mid (large number)
 	// and a varint that looks like a timestamp in ms (around current time).
-	
+
 	// Extract sender user ID from push data
 	senderID := extractCallerIDFromPush(data)
 	if senderID == 0 {
@@ -950,17 +951,17 @@ func (c *Client) trackIncomingMessageFromPush(data []byte) {
 func extractMidAndDate(data []byte) (mid int64, date int64) {
 	offset := 0
 	var varints []int64
-	
+
 	for offset < len(data) {
 		tag, newOff := decodeVarintAt(data, offset)
 		if newOff == offset {
 			offset++
 			continue
 		}
-		
+
 		fieldNum := tag >> 3
 		wireType := tag & 0x07
-		
+
 		switch wireType {
 		case 0: // varint
 			val, nextOff := decodeVarintAt(data, newOff)
@@ -968,12 +969,12 @@ func extractMidAndDate(data []byte) (mid int64, date int64) {
 				offset++
 				continue
 			}
-			
+
 			if fieldNum >= 1 && fieldNum <= 20 && val > 0 {
 				varints = append(varints, int64(val))
 			}
 			offset = nextOff
-			
+
 		case 2: // length-delimited
 			length, nextOff := decodeVarintAt(data, newOff)
 			if nextOff == newOff || nextOff+int(length) > len(data) {
@@ -981,7 +982,7 @@ func extractMidAndDate(data []byte) (mid int64, date int64) {
 				continue
 			}
 			offset = nextOff + int(length)
-			
+
 		case 1: // fixed64
 			offset = newOff + 8
 		case 5: // fixed32
@@ -990,11 +991,11 @@ func extractMidAndDate(data []byte) (mid int64, date int64) {
 			offset++
 		}
 	}
-	
+
 	// Find mid: largest varint that's not a user ID (> 1 billion, looks like randomId/mid)
 	// Find date: varint close to current time in ms
 	nowMs := time.Now().UnixMilli()
-	
+
 	for _, v := range varints {
 		// Check if it looks like a timestamp (within 1 day of now)
 		if v > nowMs-86400000 && v < nowMs+86400000 {
@@ -1029,7 +1030,6 @@ func decodeVarintAt(data []byte, offset int) (uint64, int) {
 	}
 	return 0, offset
 }
-
 
 // extractTunnelMessage finds and extracts BLETUN: prefixed text from push data.
 func (c *Client) extractTunnelMessage(data []byte) string {
@@ -1241,14 +1241,10 @@ func buildRPCMessage(service, method string, request []byte, seq uint32) []byte 
 }
 
 func buildMetadata() []byte {
-	appVersionMu.RLock()
-	currentVersion := appVersion
-	appVersionMu.RUnlock()
-
 	pairs := [][2]string{
-		{"app_version", currentVersion},
+		{"app_version", AppVersion()},
 		{"browser_type", "1"},
-		{"browser_version", "138.0.0.0"},
+		{"browser_version", BrowserVersion()},
 		{"os_type", "4"},
 		{"session_id", fmt.Sprintf("%d", time.Now().UnixMilli())},
 	}

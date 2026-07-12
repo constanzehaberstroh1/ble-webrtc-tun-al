@@ -34,11 +34,9 @@ type Server struct {
 		HandleSignalOffer(w http.ResponseWriter, r *http.Request)
 	}
 
-
-
 	// Tunnel callbacks (used by client role)
-	OnTunnelStart func() error
-	OnTunnelStop  func() error
+	OnTunnelStart   func() error
+	OnTunnelStop    func() error
 	GetTunnelStatus func() (interface{}, error)
 	GetClientID     func() string
 	OnForceEndCall  func() (map[string]interface{}, error)
@@ -133,9 +131,13 @@ func (s *Server) registerRoutes() {
 	// Settings
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
 
+	// Bale client constants — view and sync upstream parameters
+	s.mux.HandleFunc("/api/bale/constants", s.handleBaleConstants)
+	s.mux.HandleFunc("/api/bale/constants/sync", s.handleBaleConstantsSync)
+
 	// Guide
 	s.mux.HandleFunc("/api/guide", s.handleGuide)
-	
+
 	// System logs (REST + WebSocket streaming + file management)
 	s.mux.HandleFunc("/api/logs", s.handleLogs)
 	s.mux.HandleFunc("/api/logs/ws", s.handleLogsWS)
@@ -175,7 +177,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/remote/sync/push", s.handleRemoteSyncPush)
 	s.mux.HandleFunc("/api/remote/sync/push-accounts", s.handleRemoteSyncPushAccounts)
 	s.mux.HandleFunc("/api/remote/sync/push-pairings", s.handleRemotePushAllPairings)
-	s.mux.HandleFunc("/api/remote/accounts/", s.handleRemotePushSingleAccount)  // /api/remote/accounts/{id}/push
+	s.mux.HandleFunc("/api/remote/accounts/", s.handleRemotePushSingleAccount) // /api/remote/accounts/{id}/push
 	s.mux.HandleFunc("/api/remote/pairings/", s.handleRemotePushSinglePairing) // /api/remote/pairings/{id}/push
 	s.mux.HandleFunc("/api/remote/db/backup", s.handleRemoteDBBackup)
 	s.mux.HandleFunc("/api/remote/db/restore", s.handleRemoteDBRestore)
@@ -203,8 +205,6 @@ func (s *Server) SetAdminPanel(panel interface {
 }) {
 	s.adminPanel = panel
 }
-
-
 
 func (s *Server) handleSignalForward(w http.ResponseWriter, r *http.Request) {
 	if s.adminPanel != nil {

@@ -100,6 +100,10 @@ export const api = {
   baleLoginStart: (phone: string) => request('/bale/login/start', { method: 'POST', body: JSON.stringify({ phone }) }),
   baleLoginVerify: (phone: string, code: string) => request('/bale/login/verify', { method: 'POST', body: JSON.stringify({ phone, code }) }),
 
+  // Bale client constants — view and sync upstream parameters
+  getBaleConstants: () => request('/bale/constants'),
+  syncBaleConstants: () => request('/bale/constants/sync', { method: 'POST' }),
+
   // Tunnel Controls
   tunnelStart: () => request('/tunnel/start', { method: 'POST' }),
   tunnelStop: () => request('/tunnel/stop', { method: 'POST' }),

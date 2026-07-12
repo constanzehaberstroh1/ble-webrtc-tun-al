@@ -55,13 +55,6 @@ func main() {
 
 	os.Setenv("ROLE", "server")
 
-	// Fetch the live app_version (and API key) from Bale's JS bundle.
-	// Bale silently stops delivering push events (text messages, incoming calls)
-	// to clients whose app_version metadata is too old — even though the
-	// WebSocket connection stays open and pong frames keep arriving.
-	// This call updates the global before any bale.Client is created.
-	bale.FetchAndUpdateClientMeta()
-
 	cfg, err := config.Load()
 	if err != nil {
 		mainLog.Fatal("Failed to load config: %v", err)
@@ -89,6 +82,16 @@ func main() {
 		mainLog.Fatal("Database init failed: %v", err)
 	}
 	defer serverDB.Close()
+
+	// Load persisted Bale client-emulation constants from the database so they
+	// survive restarts, then refresh from the live Bale bundle.  Bale silently
+	// stops delivering push events (text messages, incoming calls) to clients
+	// whose app_version metadata is too old — even though the WebSocket stays
+	// open and pongs keep arriving — so we always fetch the latest before any
+	// bale.Client is created.
+	bale.LoadFromSettings(serverDB)
+	bale.FetchAndUpdateClientMeta()
+	bale.PersistToSettings(serverDB)
 
 	// Auto-migrate from .env.tokens if DB is empty
 	acctCount, _ := serverDB.CountAccounts("", "")
@@ -366,7 +369,6 @@ func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel 
 		}
 	}
 }
-
 
 // activeCallIDs tracks calls being processed to prevent double-accept (legacy mode).
 var (
@@ -678,7 +680,6 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 	}
 }
 
-
 func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTransport, adminPanel *admin.Server, baleClient *bale.Client, tag string, callerID int64) {
 	// Wait for remote track (client's video through SFU)
 	adminPanel.AddLog("info", tag+" Waiting for client's video track via SFU (30s)...")
@@ -713,16 +714,16 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	opusPacketInterface := quicconn.NewServer(rtpConn)
 
 	quicCfg := &quic.Config{
-		InitialPacketSize:               1140,
-		MaxIdleTimeout:                  45 * time.Second,
-		KeepAlivePeriod:                 10 * time.Second,
-		MaxIncomingStreams:              10000,
-		MaxIncomingUniStreams:           10000,
-		InitialStreamReceiveWindow:      4 * 1024 * 1024,
-		MaxStreamReceiveWindow:          32 * 1024 * 1024,
-		InitialConnectionReceiveWindow:  8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:      64 * 1024 * 1024,
-		DisablePathMTUDiscovery:         true,
+		InitialPacketSize:              1140,
+		MaxIdleTimeout:                 45 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		MaxIncomingStreams:             10000,
+		MaxIncomingUniStreams:          10000,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         32 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		DisablePathMTUDiscovery:        true,
 	}
 
 	// Host a dedicated QUIC server instance strictly for this channel pair.
@@ -756,7 +757,7 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 
 	// Monitor
 	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
-	drainLoop:
+drainLoop:
 	for {
 		select {
 		case msg := <-baleClient.TextMsgCh:
@@ -1117,5 +1118,3 @@ func itoa64(n int64) string {
 	}
 	return string(b)
 }
-
-

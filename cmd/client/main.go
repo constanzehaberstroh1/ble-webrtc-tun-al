@@ -74,6 +74,14 @@ func main() {
 	}
 	defer clientDB.Close()
 
+	// Load persisted Bale client-emulation constants from the database, then
+	// refresh from the live Bale bundle.  Bale silently stops delivering push
+	// events to clients whose app_version is too old, so we always fetch the
+	// latest before creating any bale.Client.
+	bale.LoadFromSettings(clientDB)
+	bale.FetchAndUpdateClientMeta()
+	bale.PersistToSettings(clientDB)
+
 	// Auto-migrate from .env.tokens if DB is empty
 	acctCount, _ := clientDB.CountAccounts("", "")
 	if acctCount == 0 {
