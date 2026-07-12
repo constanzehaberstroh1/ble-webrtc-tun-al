@@ -28,10 +28,6 @@ const (
 
 	// circuitBreakerKill: consecutive failures that trigger force-close.
 	circuitBreakerKill = int32(5)
-
-	// preOpenPoolSize is the number of pre-opened idle streams maintained
-	// per artery for instant first-request serving.
-	preOpenPoolSize = 2
 )
 
 // ── ArteryPool ─────────────────────────────────────────────────────────
@@ -47,32 +43,14 @@ type ArteryPool struct {
 
 	// Round-robin cursor for WRR distribution.
 	cursor atomic.Uint64
-
-	// Pre-opened stream pool for instant serving.
-	preOpenMu     sync.Mutex
-	preOpenPool   map[string][]preOpenedStream
-	preOpenDone   chan struct{}
-	preOpenOnce   sync.Once
-}
-
-// preOpenedStream holds an idle stream ready for immediate use.
-type preOpenedStream struct {
-	conn    net.Conn
-	artery  *Artery
-	created time.Time
 }
 
 // NewArteryPool creates a new empty artery pool.
 func NewArteryPool() *ArteryPool {
-	p := &ArteryPool{
-		arteries:    make(map[string]*Artery),
-		done:        make(chan struct{}),
-		preOpenPool: make(map[string][]preOpenedStream),
-		preOpenDone: make(chan struct{}),
+	return &ArteryPool{
+		arteries: make(map[string]*Artery),
+		done:     make(chan struct{}),
 	}
-	// Start the pre-open replenisher in the background.
-	go p.preOpenReplenisher()
-	return p
 }
 
 // Register adds a fully-established QUIC connection as an ACTIVE artery.
@@ -106,16 +84,6 @@ func (p *ArteryPool) Unregister(label string) {
 	}
 	n := len(p.arteries)
 	p.mu.Unlock()
-
-	// Drain pre-opened streams for this artery.
-	p.preOpenMu.Lock()
-	if streams, ok := p.preOpenPool[label]; ok {
-		for _, s := range streams {
-			s.conn.Close()
-		}
-		delete(p.preOpenPool, label)
-	}
-	p.preOpenMu.Unlock()
 
 	schedLog.Info("[Pool] Unregistered %s (remaining: %d)", label, n)
 }
@@ -190,13 +158,7 @@ func (p *ArteryPool) OpenStream() (net.Conn, error) {
 		return nil, fmt.Errorf("no healthy ACTIVE arteries available")
 	}
 
-	// ── Step 1: Try pre-opened stream pool (instant, 0ms latency) ──────
-	stream := p.tryPreOpened(candidates)
-	if stream != nil {
-		return stream, nil
-	}
-
-	// ── Step 2: P2C + WRR selection ────────────────────────────────────
+	// ── P2C + WRR selection ────────────────────────────────────────────
 	selected := p.p2cSelect(candidates)
 
 	// Try the selected candidate first, then fall through remaining.
@@ -270,112 +232,6 @@ func (p *ArteryPool) p2cSelect(candidates []streamCandidate) streamCandidate {
 		return a
 	}
 	return b
-}
-
-// tryPreOpened tries to return a pre-opened stream from the pool.
-// Returns nil if no valid pre-opened stream is available.
-func (p *ArteryPool) tryPreOpened(candidates []streamCandidate) net.Conn {
-	p.preOpenMu.Lock()
-	defer p.preOpenMu.Unlock()
-
-	// Try candidates in round-robin order.
-	cursor := p.cursor.Load()
-	n := len(candidates)
-
-	for attempt := 0; attempt < n; attempt++ {
-		idx := int((cursor + uint64(attempt)) % uint64(n))
-		c := candidates[idx]
-
-		streams, ok := p.preOpenPool[c.label]
-		if !ok || len(streams) == 0 {
-			continue
-		}
-
-		// Pop the first pre-opened stream.
-		s := streams[0]
-		p.preOpenPool[c.label] = streams[1:]
-
-		// Validate: skip if too old (>10s) or artery changed state.
-		if time.Since(s.created) > 10*time.Second {
-			s.conn.Close()
-			continue
-		}
-		if s.artery.State() != StateActive || !s.artery.IsAlive() {
-			s.conn.Close()
-			continue
-		}
-
-		// Success — track the assignment.
-		s.artery.IncrementStreams()
-		s.artery.Tel().IncrementTotalStreams()
-		p.cursor.Add(1)
-		return s.conn
-	}
-	return nil
-}
-
-// preOpenReplenisher runs in the background and maintains a small pool of
-// pre-opened QUIC streams for each active artery. These streams can be
-// returned instantly by OpenStream(), eliminating the stream-open RTT
-// for the first few requests on each page load.
-func (p *ArteryPool) preOpenReplenisher() {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.preOpenDone:
-			return
-		case <-p.done:
-			return
-		case <-ticker.C:
-		}
-
-		p.mu.RLock()
-		arteries := make([]*Artery, 0, len(p.arteries))
-		labels := make([]string, 0, len(p.arteries))
-		for label, a := range p.arteries {
-			if a.State() == StateActive && a.IsAlive() {
-				arteries = append(arteries, a)
-				labels = append(labels, label)
-			}
-		}
-		p.mu.RUnlock()
-
-		for i, a := range arteries {
-			label := labels[i]
-
-			p.preOpenMu.Lock()
-			current := len(p.preOpenPool[label])
-			p.preOpenMu.Unlock()
-
-			if current >= preOpenPoolSize {
-				continue
-			}
-
-			// Open a stream with short timeout.
-			ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
-			stream, err := a.QConn().OpenStreamSync(ctx)
-			cancel()
-
-			if err != nil {
-				continue
-			}
-
-			wrapped := &trackedStream{
-				Conn:   wrapQUICStream(stream, a.QConn()),
-				artery: a,
-			}
-
-			p.preOpenMu.Lock()
-			p.preOpenPool[label] = append(p.preOpenPool[label], preOpenedStream{
-				conn:    wrapped,
-				artery:  a,
-				created: time.Now(),
-			})
-			p.preOpenMu.Unlock()
-		}
-	}
 }
 
 // ── Pool statistics ────────────────────────────────────────────────────
