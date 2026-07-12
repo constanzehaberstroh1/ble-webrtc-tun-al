@@ -107,9 +107,14 @@ var reBaleWSURL = regexp.MustCompile(`(wss?://[a-zA-Z0-9.-]+\.bale\.ai[a-zA-Z0-9
 var reBaleHTTPURL = regexp.MustCompile(`(https?://[a-zA-Z0-9.-]+\.bale\.ai[a-zA-Z0-9./_:-]*)`)
 var reBleIrURL = regexp.MustCompile(`(https?://[a-zA-Z0-9.-]+\.ble\.ir[a-zA-Z0-9./_:-]*)`)
 
-// scrapeClient builds an HTTP client that mimics a real Chrome browser.
+// scrapeClient builds an HTTP client that mimics a real Chrome browser and
+// resolves hosts through the admin-configured application DNS engine when
+// available.
 func scrapeClient() *http.Client {
-	return &http.Client{Timeout: 20 * time.Second}
+	return &http.Client{
+		Transport: newHTTPTransport(),
+		Timeout:   20 * time.Second,
+	}
 }
 
 // scrapeUserAgent returns a Chrome User-Agent using the current browser version.

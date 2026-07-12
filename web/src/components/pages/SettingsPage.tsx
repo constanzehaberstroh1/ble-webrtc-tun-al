@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Card, Typography, Select, Button, Space, Row, Col, Tag, message, Descriptions, Badge, Alert, Upload, Divider } from 'antd';
-import { SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined, UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined, GlobalOutlined } from '@ant-design/icons';
+import { Card, Typography, Select, Button, Space, Row, Col, Tag, message, Descriptions, Badge, Alert, Upload, Divider, Input } from 'antd';
+import { SyncOutlined, CloudSyncOutlined, CheckCircleOutlined, DownloadOutlined, UploadOutlined, DatabaseOutlined, ExclamationCircleOutlined, LinkOutlined, GlobalOutlined, SafetyCertificateOutlined, ApiOutlined } from '@ant-design/icons';
 import { useTheme, THEMES, MODES } from '../../ThemeContext';
 import { api } from '../../api';
 
@@ -28,6 +28,8 @@ export function SettingsPage() {
   const [remoteServerURL, setRemoteServerURL] = useState<string>('');
   const [baleConstants, setBaleConstants] = useState<any>(null);
   const [baleSyncing, setBaleSyncing] = useState(false);
+  const [routing, setRouting] = useState({ dns_primary: '', dns_secondary: '', bypass_domains: '' });
+  const [routingSaving, setRoutingSaving] = useState(false);
 
   const loadSyncStatus = useCallback(async () => {
     try {
@@ -49,7 +51,18 @@ export function SettingsPage() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => { loadSyncStatus(); loadBaleConstants(); }, [loadSyncStatus, loadBaleConstants]);
+  const loadRoutingSettings = useCallback(async () => {
+    try {
+      const data = await api.getRoutingSettings();
+      setRouting({
+        dns_primary: data.dns_primary || '',
+        dns_secondary: data.dns_secondary || '',
+        bypass_domains: data.bypass_domains || '',
+      });
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { loadSyncStatus(); loadBaleConstants(); loadRoutingSettings(); }, [loadSyncStatus, loadBaleConstants, loadRoutingSettings]);
 
   const handleBaleSync = async () => {
     setBaleSyncing(true);
@@ -257,14 +270,94 @@ export function SettingsPage() {
         )}
       </Card>
 
+      {/* Application-Level DNS & Split-Tunneling */}
+      <Card
+        title={<><SafetyCertificateOutlined className="mr-2" />Application DNS &amp; Split-Tunneling</>}
+        bordered={false}
+        className="shadow-sm mb-6"
+        extra={
+          <Button
+            type="primary"
+            icon={<SyncOutlined spin={routingSaving} />}
+            loading={routingSaving}
+            onClick={async () => {
+              setRoutingSaving(true);
+              try {
+                await api.updateRoutingSettings({
+                  dns_primary: routing.dns_primary.trim(),
+                  dns_secondary: routing.dns_secondary.trim(),
+                  bypass_domains: routing.bypass_domains.trim(),
+                });
+                message.success('Routing settings applied — new connections use updated DNS & bypass rules instantly');
+                await loadRoutingSettings();
+              } catch (e: any) {
+                message.error(e.message || 'Failed to save routing settings');
+              } finally {
+                setRoutingSaving(false);
+              }
+            }}
+          >
+            Apply
+          </Button>
+        }
+      >
+        <Alert
+          message="Application-Level DNS Resolution & Request Splitting"
+          description={
+            <div>
+              <p className="mb-1">All domain resolution and proxy traffic routing is performed through the DNS servers below, decoupled from the host OS resolver.</p>
+              <p className="mb-0">Iranian-domestic domains (servers hosted on Iranian IPs) and the custom bypass list below route <strong>directly over the local network</strong>, bypassing the WebRTC tunnel. Bale's own servers are never bypassed and always use the tunnel + custom DNS.</p>
+            </div>
+          }
+          type="info"
+          showIcon
+          icon={<ApiOutlined />}
+          className="mb-4"
+        />
+
+        <Row gutter={[24, 16]}>
+          <Col xs={24} md={12}>
+            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Primary DNS Server</Text>
+            <Input
+              size="large"
+              placeholder="1.1.1.1"
+              value={routing.dns_primary}
+              onChange={(e) => setRouting({ ...routing, dns_primary: e.target.value })}
+            />
+          </Col>
+          <Col xs={24} md={12}>
+            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">Secondary DNS Server</Text>
+            <Input
+              size="large"
+              placeholder="1.0.0.1"
+              value={routing.dns_secondary}
+              onChange={(e) => setRouting({ ...routing, dns_secondary: e.target.value })}
+            />
+          </Col>
+          <Col xs={24}>
+            <Text type="secondary" strong className="block mb-2 uppercase text-xs tracking-wider">
+              Bypass Domains (comma-separated)
+            </Text>
+            <Input.TextArea
+              rows={3}
+              placeholder="example.com, bank.ir, my-site.ir"
+              value={routing.bypass_domains}
+              onChange={(e) => setRouting({ ...routing, bypass_domains: e.target.value })}
+            />
+            <Text type="secondary" className="block mt-2 text-xs">
+              Domains listed here (and their subdomains) bypass the tunnel and route directly over the local internet. Iranian-domestic IPs are detected automatically. Bale domains (<code>.bale.ai</code>, <code>.ble.ir</code>) are always tunneled.
+            </Text>
+          </Col>
+        </Row>
+      </Card>
+
       {/* Server URLs */}
       {(serverURLs.length > 0 || remoteServerURL) && (
         <Card
           title={<><GlobalOutlined className="mr-2" />Server Addresses</>}
           bordered={false}
           className="shadow-sm mb-6"
-        >
-          <Text type="secondary" className="block mb-3">
+        >          <Text type="secondary" className="block mb-3">
             {panelRole === 'SERVER'
               ? 'This server is accessible at the following URLs:'
               : 'Connected remote server addresses:'}

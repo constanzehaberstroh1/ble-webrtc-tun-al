@@ -104,6 +104,11 @@ export const api = {
   getBaleConstants: () => request('/bale/constants'),
   syncBaleConstants: () => request('/bale/constants/sync', { method: 'POST' }),
 
+  // Routing configuration (application-level DNS + split-tunneling bypass)
+  getRoutingSettings: () => request('/routing/settings'),
+  updateRoutingSettings: (data: { dns_primary: string; dns_secondary: string; bypass_domains: string }) =>
+    request('/routing/settings', { method: 'POST', body: JSON.stringify(data) }),
+
   // Tunnel Controls
   tunnelStart: () => request('/tunnel/start', { method: 'POST' }),
   tunnelStop: () => request('/tunnel/stop', { method: 'POST' }),

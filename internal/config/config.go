@@ -192,6 +192,20 @@ type Config struct {
 
 	// Logging
 	LogLevel string
+
+	// Application-Level DNS Configuration (client-side).
+	// All domain resolution for Bale signaling/SFU connections and proxy
+	// split-routing decisions is performed through these upstream DNS roots,
+	// decoupled from the host OS resolver.  Defaults can be overridden at
+	// runtime from the admin dashboard (stored in the DB settings table).
+	DNSPrimary   string
+	DNSSecondary string
+
+	// Extensible Domain Bypass Mappings (client-side).
+	// A comma-separated list of domains whose traffic should bypass the
+	// WebRTC tunnel and route directly over the local network interface
+	// (e.g. domestic Iranian sites).  Bale's own domains are never bypassed.
+	BypassDomains string
 }
 
 // Load reads configuration from .env file and environment variables.
@@ -231,6 +245,10 @@ func Load() (*Config, error) {
 		NumTracks: getEnvInt("BLE_TUNNEL_TRACKS", 3),
 
 		LogLevel: getEnv("LOG_LEVEL", "info"),
+
+		DNSPrimary:    getEnv("BLE_DNS_PRIMARY", "1.1.1.1"),
+		DNSSecondary:  getEnv("BLE_DNS_SECONDARY", "1.0.0.1"),
+		BypassDomains: getEnv("BLE_BYPASS_DOMAINS", ""),
 	}
 
 	// Set defaults based on role

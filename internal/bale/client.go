@@ -369,6 +369,9 @@ func (c *Client) Connect() error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 	}
+	if dc := appDial(); dc != nil {
+		dialer.NetDialContext = dc
+	}
 
 	conn, _, err := dialer.Dial(BaleWSURL(), headers)
 	if err != nil {

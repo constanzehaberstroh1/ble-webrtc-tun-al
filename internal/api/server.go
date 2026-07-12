@@ -41,6 +41,11 @@ type Server struct {
 	GetClientID     func() string
 	OnForceEndCall  func() (map[string]interface{}, error)
 
+	// Routing callbacks (used by client role) — application-level DNS and
+	// split-tunneling bypass configuration, hot-swappable from the dashboard.
+	GetRoutingSettings func() (map[string]string, error)
+	OnReloadRouting    func(primary, secondary, bypass string) error
+
 	// Remote server URL (auto-detected from Clever Cloud, used by client)
 	RemoteServerURL string
 }
@@ -190,6 +195,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/tunnel/status", s.handleTunnelStatus)
 	s.mux.HandleFunc("/api/tunnel/force-end-call", s.handleTunnelForceEndCall)
 	s.mux.HandleFunc("/api/client-id", s.handleClientID)
+
+	// Routing configuration (application-level DNS + split-tunneling bypass)
+	s.mux.HandleFunc("/api/routing/settings", s.handleRoutingSettings)
 
 	// Web Terminal (xterm.js)
 	s.mux.HandleFunc("/api/terminal/ws", s.handleTerminalWS)

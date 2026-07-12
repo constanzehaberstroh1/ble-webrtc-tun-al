@@ -63,6 +63,9 @@ func (s *SignalClient) Connect(ctx context.Context) error {
 		HandshakeTimeout: 15 * time.Second,
 		Subprotocols:     []string{bale.ProtocolSubprotocol()},
 	}
+	if dc := appDial(); dc != nil {
+		dialer.NetDialContext = dc
+	}
 
 	headers := http.Header{
 		"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},

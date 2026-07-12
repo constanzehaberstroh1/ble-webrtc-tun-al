@@ -713,16 +713,19 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	// Create a dedicated OpusPacketConn for this lane's QUIC server.
 	opusPacketInterface := quicconn.NewServer(rtpConn)
 
+	// MTU CLAMPING: 1060 bytes (QUIC) + 40 bytes (XChaCha20 envelope) +
+	// 33 bytes (Opus TOC + max VBR padding) = 1133 bytes wire footprint.
+	// Must match client config to prevent SFU UDP truncation.
 	quicCfg := &quic.Config{
-		InitialPacketSize:              1140,
+		InitialPacketSize:              1060,
 		MaxIdleTimeout:                 45 * time.Second,
 		KeepAlivePeriod:                10 * time.Second,
 		MaxIncomingStreams:             10000,
 		MaxIncomingUniStreams:          10000,
-		InitialStreamReceiveWindow:     4 * 1024 * 1024,
-		MaxStreamReceiveWindow:         32 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:         64 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
 		DisablePathMTUDiscovery:        true,
 	}
 

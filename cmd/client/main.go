@@ -163,6 +163,17 @@ func main() {
 	apiSrv.OnForceEndCall = func() (map[string]interface{}, error) {
 		return tm.ForceEndCall()
 	}
+	apiSrv.GetRoutingSettings = func() (map[string]string, error) {
+		primary, secondary, bypass := tm.GetRoutingSettings()
+		return map[string]string{
+			"dns_primary":    primary,
+			"dns_secondary":  secondary,
+			"bypass_domains": bypass,
+		}, nil
+	}
+	apiSrv.OnReloadRouting = func(primary, secondary, bypass string) error {
+		return tm.ReloadRouting(primary, secondary, bypass)
+	}
 
 	mainLog.Info("Client initialized. Use admin panel to add accounts, create pairings, and connect.")
 
@@ -267,6 +278,11 @@ type TunnelManager struct {
 
 	// Artery orchestrator (autonomous health management)
 	orchestrator *artery.Orchestrator
+
+	// Routing engine — client-side traffic classification and DNS resolution.
+	// Wraps the application-level DNS resolver and the split-tunneling bypass
+	// engine.  Hot-swappable from the admin dashboard.
+	routing *RoutingEngine
 }
 
 func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accounts.Manager) *TunnelManager {
@@ -298,7 +314,44 @@ func NewTunnelManager(cfg *config.Config, database *db.Database, manager *accoun
 		clientID:   clientID,
 		obfuscator: obf,
 		refresh:    &refreshSupervisor{},
+		routing:    initRoutingEngine(cfg, database),
 	}
+}
+
+// routingSettingKeys are the DB setting keys for the application-level DNS and
+// split-tunneling bypass configuration.
+const (
+	settingDNSPrimary    = "dns_primary"
+	settingDNSSecondary  = "dns_secondary"
+	settingBypassDomains = "bypass_domains"
+)
+
+// initRoutingEngine loads the application-level DNS and bypass-domain settings
+// from the database (falling back to config/env defaults), builds the
+// RoutingEngine, and installs the custom DNS into the Bale and LiveKit
+// packages so all Bale infrastructure connections resolve through the
+// admin-configured upstream DNS roots.
+func initRoutingEngine(cfg *config.Config, database *db.Database) *RoutingEngine {
+	primary := cfg.DNSPrimary
+	secondary := cfg.DNSSecondary
+	bypassDomains := cfg.BypassDomains
+
+	// Override with persisted DB settings if present (admin dashboard values).
+	if v, err := database.GetSetting(settingDNSPrimary); err == nil && v != "" {
+		primary = v
+	}
+	if v, err := database.GetSetting(settingDNSSecondary); err == nil && v != "" {
+		secondary = v
+	}
+	if v, err := database.GetSetting(settingBypassDomains); err == nil && v != "" {
+		bypassDomains = v
+	}
+
+	re := NewRoutingEngine(primary, secondary, bypassDomains)
+	re.InstallAppDNS()
+	mainLog.Info("Routing engine ready: DNS=%s/%s bypass-domains=%d entries",
+		primary, secondary, len(strings.Split(bypassDomains, ",")))
+	return re
 }
 
 // getOrCreateClientID generates or loads a persistent client ID.
@@ -326,6 +379,57 @@ func (tm *TunnelManager) IsActive() bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	return tm.active
+}
+
+// ReloadRouting hot-swaps the application DNS targets and bypass-domain list
+// from the admin dashboard.  Persists the new values to the database, rebuilds
+// the routing engine's resolver and bypass trie, and re-installs the updated
+// DNS into the Bale/LiveKit packages so new connections use the new roots
+// instantly — no tunnel restart required.
+func (tm *TunnelManager) ReloadRouting(primary, secondary, bypassDomains string) error {
+	// Persist to database.
+	if err := tm.database.SetSetting(settingDNSPrimary, primary); err != nil {
+		return fmt.Errorf("persist dns_primary: %w", err)
+	}
+	if err := tm.database.SetSetting(settingDNSSecondary, secondary); err != nil {
+		return fmt.Errorf("persist dns_secondary: %w", err)
+	}
+	if err := tm.database.SetSetting(settingBypassDomains, bypassDomains); err != nil {
+		return fmt.Errorf("persist bypass_domains: %w", err)
+	}
+
+	// Rebuild and re-install.
+	tm.mu.Lock()
+	re := tm.routing
+	tm.mu.Unlock()
+	if re == nil {
+		re = NewRoutingEngine(primary, secondary, bypassDomains)
+		tm.mu.Lock()
+		tm.routing = re
+		tm.mu.Unlock()
+	} else {
+		re.Reload(primary, secondary, bypassDomains)
+	}
+	re.InstallAppDNS()
+	mainLog.Info("[Manager] Routing reloaded: DNS=%s/%s bypass-domains=%d",
+		primary, secondary, len(strings.Split(bypassDomains, ",")))
+	return nil
+}
+
+// GetRoutingSettings returns the current application DNS and bypass-domain
+// configuration for the admin API.
+func (tm *TunnelManager) GetRoutingSettings() (primary, secondary, bypassDomains string) {
+	tm.mu.Lock()
+	re := tm.routing
+	tm.mu.Unlock()
+	if re == nil {
+		// Fall back to DB-persisted values.
+		primary, _ = tm.database.GetSetting(settingDNSPrimary)
+		secondary, _ = tm.database.GetSetting(settingDNSSecondary)
+		bypassDomains, _ = tm.database.GetSetting(settingBypassDomains)
+		return
+	}
+	return re.Snapshot()
 }
 
 // GetDetailedStatus returns the full tunnel status with per-channel details.
@@ -788,8 +892,8 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 	// Start SOCKS5 / HTTP proxies once at least one QUIC connection is live.
 	proxyOnce.Do(func() {
-		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
 		mainLog.Info(" ✅ Proxies started!")
 		for _, ip := range getLocalIPs() {
 			mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
@@ -906,11 +1010,11 @@ func (tm *TunnelManager) monitorAndReconnect(
 
 				if currentCh != nil && currentQConn != nil {
 					backoff = 3 * time.Second
-					proxyOnce.Do(func() {
-						go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-						go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-					})
-					refreshAt = time.Now().Add(tm.nextRefreshInterval())
+				proxyOnce.Do(func() {
+					go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+					go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
+				})
+				refreshAt = time.Now().Add(tm.nextRefreshInterval())
 					mainLog.Info("[%s] 🔄 Next scheduled refresh in %v", label, time.Until(refreshAt).Round(time.Second))
 					select {
 					case <-ctx.Done():
@@ -997,12 +1101,12 @@ func (tm *TunnelManager) monitorAndReconnect(
 		mainLog.Info("[%s] ✅ Reconnected!", label)
 		backoff = 3 * time.Second
 
-		proxyOnce.Do(func() {
-			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-		})
+	proxyOnce.Do(func() {
+		go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool, tm.routing)
+		go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool, tm.routing)
+	})
 
-		select {
+	select {
 		case <-ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
@@ -1112,21 +1216,20 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	opusPC := quicconn.NewClient(rtpConn)
 
 	// QUIC config: each connection is independent — no bond header overhead.
-	initPktSize := uint16(1140)
-	if tm.obfuscator != nil && tm.obfuscator.Enabled() {
-		initPktSize = 1100
-	}
+	// MTU CLAMPING: 1060 bytes (QUIC) + 40 bytes (XChaCha20 envelope) +
+	// 33 bytes (Opus TOC + max VBR padding) = 1133 bytes wire footprint.
+	// This safely passes through all SFU UDP MTU limiters (1200 byte cap).
 	quicCfg := &quic.Config{
-		InitialPacketSize:              initPktSize,
+		InitialPacketSize:              1060,
 		MaxIdleTimeout:                 45 * time.Second,
 		HandshakeIdleTimeout:           20 * time.Second,
 		KeepAlivePeriod:                10 * time.Second,
 		MaxIncomingStreams:             10000,
 		MaxIncomingUniStreams:          10000,
-		InitialStreamReceiveWindow:     4 * 1024 * 1024,
-		MaxStreamReceiveWindow:         32 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:         64 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
 		DisablePathMTUDiscovery:        true,
 	}
 
@@ -1226,7 +1329,7 @@ func getLocalIPs() []string {
 
 // ===================== SOCKS5 Proxy =====================
 
-func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool) {
+func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool, re *RoutingEngine) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		mainLog.Fatal("[SOCKS5] Listen error: %v", err)
@@ -1247,11 +1350,11 @@ func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool) {
 			}
 			continue
 		}
-		go handleSOCKS5(conn, p)
+		go handleSOCKS5(conn, p, re)
 	}
 }
 
-func handleSOCKS5(conn net.Conn, p *pool.TunnelPool) {
+func handleSOCKS5(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
@@ -1305,12 +1408,17 @@ func handleSOCKS5(conn net.Conn, p *pool.TunnelPool) {
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	conn.SetDeadline(time.Time{})
 
-	dialAndRelay(p, targetAddr, conn)
+	// Classify and route: bypass (direct local) or tunnel (QUIC pool).
+	if re != nil {
+		re.classifyAndRelay(targetAddr, conn, p)
+	} else {
+		dialAndRelay(p, targetAddr, conn)
+	}
 }
 
 // ===================== HTTP CONNECT Proxy =====================
 
-func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool) {
+func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool, re *RoutingEngine) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		mainLog.Fatal("[HTTP] Listen error: %v", err)
@@ -1331,11 +1439,11 @@ func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool) {
 			}
 			continue
 		}
-		go handleHTTPProxy(conn, p)
+		go handleHTTPProxy(conn, p, re)
 	}
 }
 
-func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
+func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
@@ -1368,14 +1476,18 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
 	headersStr := headersBuilder.String()
 
 	if method == "CONNECT" {
-		// HTTPS tunnel
+		// HTTPS tunnel — classify before relaying.
 		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 		conn.SetDeadline(time.Time{})
-		dialAndRelay(p, target, conn)
+		if re != nil {
+			re.classifyAndRelay(target, conn, p)
+		} else {
+			dialAndRelay(p, target, conn)
+		}
 		return
 	}
 
-	// Plain HTTP — forward through tunnel
+	// Plain HTTP — forward through tunnel or direct local (bypass).
 	host := target
 	path := target
 	if strings.HasPrefix(target, "http://") {
@@ -1394,45 +1506,27 @@ func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool) {
 	reqLine := fmt.Sprintf("%s %s %s\r\n%s", method, path, parts[2], headersStr)
 	conn.SetDeadline(time.Time{})
 
-	// Open stream from pool
-	stream, err := p.OpenStream()
-	if err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
+	if re != nil {
+		re.classifyHTTPPlain(host, reqLine, conn, p)
+	} else {
+		httpTunnelRelay(p, host, reqLine, conn)
 	}
-	defer stream.Close()
-
-	// Send target address as length-prefixed header
-	addrBytes := []byte(host)
-	hdr := make([]byte, 2+len(addrBytes))
-	binary.BigEndian.PutUint16(hdr[:2], uint16(len(addrBytes)))
-	copy(hdr[2:], addrBytes)
-	if _, err := stream.Write(hdr); err != nil {
-		io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
-	}
-
-	// Send the HTTP request
-	stream.Write([]byte(reqLine))
-
-	// Bidirectional relay using 256KB buffers
-	done := make(chan struct{}, 2)
-	go func() {
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(stream, conn, buf)
-		done <- struct{}{}
-	}()
-	go func() {
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(conn, stream, buf)
-		done <- struct{}{}
-	}()
-	<-done
 }
 
 // ===================== Common Relay =====================
 
-// dialAndRelay opens a stream from the pool, sends the target address, then relays data.
+// dialAndRelay opens a stream from the pool via ECF scheduling, sends the
+// target address, then relays data bidirectionally.
+//
+// BANDWIDTH BONDING STRATEGY:
+// Each new TCP connection (SOCKS5/HTTP) is independently ECF-routed to the
+// artery with the lowest expected completion time.  Modern browsers open 6+
+// concurrent connections per domain, so large downloads naturally spread
+// across all available arteries without requiring sub-stream chunking.
+//
+// Within a single TCP session, data stays on one QUIC stream (preserving
+// TCP ordering semantics).  QUIC's own congestion control manages flow
+// on that artery while the ECF scheduler keeps new sessions balanced.
 func dialAndRelay(p *pool.TunnelPool, addr string, localConn net.Conn) {
 	stream, err := p.OpenStream()
 	if err != nil {
@@ -1451,15 +1545,17 @@ func dialAndRelay(p *pool.TunnelPool, addr string, localConn net.Conn) {
 		return
 	}
 
-	// Bidirectional relay using 256KB buffers (reduces syscall overhead over TURN relay)
+	// Bidirectional relay using 32KB buffers.
+	// Smaller buffers improve latency and reduce memory pressure vs 256KB.
+	// QUIC's own flow control and congestion window manage throughput.
 	done := make(chan struct{}, 2)
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(stream, localConn, buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 32*1024)
 		io.CopyBuffer(localConn, stream, buf)
 		done <- struct{}{}
 	}()

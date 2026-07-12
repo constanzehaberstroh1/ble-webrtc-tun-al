@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -52,10 +51,7 @@ func NewAuthClientWithToken(token string) *AuthClient {
 }
 
 func newAuthClient(token string) *AuthClient {
-	transport := &http.Transport{
-		TLSClientConfig:   &tls.Config{},
-		ForceAttemptHTTP2: true,
-	}
+	transport := newHTTPTransport()
 	return &AuthClient{
 		httpClient: &http.Client{
 			Transport: transport,

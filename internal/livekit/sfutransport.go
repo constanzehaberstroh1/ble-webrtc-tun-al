@@ -84,13 +84,16 @@ type SFUTransport struct {
 
 // NewSFUTransport creates a transport that routes through the LiveKit SFU.
 // If obfuscator is nil, a passthrough (disabled) obfuscator is used.
-// The number of audio tracks is taken from cfg.NumTracks (default 3 for
-// spatial multi-tracking camouflage).
+//
+// LINEARIZED TRANSPORT: Each SFU transport creates exactly ONE Opus audio
+// track.  Multi-track striping has been removed because it causes QUIC
+// congestion collapse via sub-transport packet reordering.  Bandwidth
+// aggregation across pairs is handled by the Artery Orchestrator ABOVE
+// QUIC, not below it.
 func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTransport {
-	numTracks := 3
-	if cfg != nil && cfg.NumTracks > 0 {
-		numTracks = cfg.NumTracks
-	}
+	// Force exactly 1 track per artery to prevent sub-transport reordering.
+	// Multi-path bonding happens at the Orchestrator layer above QUIC.
+	numTracks := 1
 	s := &SFUTransport{
 		cfg:              cfg,
 		obfuscator:       obfuscator,
@@ -102,7 +105,7 @@ func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTran
 		numTracks:        numTracks,
 	}
 	s.lastPongTime.Store(time.Now().UnixMilli())
-	sfuLog.Info("SFU transport: %d audio track(s) configured", numTracks)
+	sfuLog.Info("SFU transport: 1 audio track (linearized — no sub-transport reordering)")
 	return s
 }
 
@@ -120,6 +123,9 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false},
 		HandshakeTimeout: 15 * time.Second,
 		Subprotocols:     []string{bale.ProtocolSubprotocol()},
+	}
+	if dc := appDial(); dc != nil {
+		dialer.NetDialContext = dc
 	}
 	headers := http.Header{
 		"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
@@ -194,11 +200,13 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 		return fmt.Errorf("publish: %w", err)
 	}
 
-	// 10. Setup data transport — prefer RTP audio tunnel for DPI evasion
-	// Create rtpconn adapter with multi-track pool: data is striped round-robin
-	// across the Opus track pool for spatial multi-tracking camouflage.
+	// 10. Setup data transport — linearized 1:1 track-to-QUIC binding.
+	// Each artery gets exactly one Opus track to prevent sub-transport
+	// reordering that collapses QUIC's congestion window.
 	s.mu.Lock()
-	s.rtpDataConn = rtpconn.NewMulti(s.tracks, s.obfuscator)
+	if len(s.tracks) > 0 {
+		s.rtpDataConn = rtpconn.New(s.tracks[0], s.obfuscator)
+	}
 	s.useRTP = true
 	s.connected = true
 	s.mu.Unlock()
@@ -266,13 +274,10 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Create Opus audio tracks — DPI sees a normal voice call / group call
-	// with multiple active lines.  Data is striped round-robin across these
-	// tracks by rtpconn for spatial multi-tracking camouflage.
-	numTracks := s.numTracks
-	if numTracks < 1 {
-		numTracks = 1
-	}
+	// Create exactly ONE Opus audio track — linearized transport.
+	// DPI sees a normal single-line voice call.
+	// Multi-path bonding is handled by the Artery Orchestrator above QUIC.
+	numTracks := 1 // Force 1 track per artery
 	s.tracks = s.tracks[:0] // reset
 	for i := 0; i < numTracks; i++ {
 		track, err := webrtc.NewTrackLocalStaticSample(

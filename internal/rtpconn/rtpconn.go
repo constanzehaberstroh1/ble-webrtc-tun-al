@@ -1,4 +1,13 @@
-// Package rtpconn bridges the Pion WebRTC Opus track to quic-go via WriteFrame/ReadPacket.
+// Package rtpconn bridges ONE Pion WebRTC Opus track to ONE quic-go connection
+// via WriteFrame/ReadPacket.
+//
+// CRITICAL ARCHITECTURE RULE — 1:1 Track-to-QUIC Binding:
+//
+//	Each QUIC connection MUST bind to exactly ONE WebRTC Opus track.
+//	Multi-path load balancing happens ABOVE QUIC at the Orchestrator layer,
+//	NEVER below it.  Striping datagrams from a single QUIC connection across
+//	multiple tracks causes sub-transport packet reordering, which triggers
+//	QUIC's congestion control to permanently collapse the CWND to minimum.
 //
 // SPEED ARCHITECTURE (post-pacer removal):
 //
@@ -13,7 +22,8 @@
 //
 // Result: QUIC can blast packets at full link speed. The SFU sees valid RTP
 // timestamps (it checks timestamps, not wall-clock arrival rate). The track
-// stays alive during idle periods via silence frames.
+// stays alive during idle periods via silence frames.  QUIC's congestion window
+// opens to its maximum because packets arrive in perfect sequence order.
 package rtpconn
 
 import (
@@ -33,8 +43,8 @@ var rtpLog = logger.New("rtpconn")
 
 const (
 	// maxPlainChunkSize is only used by the legacy Write() method.
-	// WriteFrame() receives pre-sized QUIC datagrams (≤1100 bytes).
-	maxPlainChunkSize = 1160
+	// WriteFrame() receives pre-sized QUIC datagrams (≤1060 bytes).
+	maxPlainChunkSize = 1060
 
 	// sampleDuration is passed to Pion's WriteSample so it can compute
 	// the correct RTP timestamp increment (960 samples at 48kHz per 20ms).
@@ -48,19 +58,16 @@ const (
 // Sent when the track is idle to prevent the SFU from tearing it down.
 var minimalOpusSilence = []byte{0xF8, 0xFF, 0xFE}
 
-// Conn wraps one or more Pion local audio tracks and an RTP receive channel.
+// Conn wraps exactly ONE Pion local audio track and an RTP receive channel.
 // It exposes WriteFrame/ReadPacket for quic-go's OpusPacketConn bridge,
 // and the legacy Read/Write interface for backward compatibility.
 //
-// Phase 3 — Spatial Multi-Tracking: when multiple tracks are provided, data
-// frames are striped round-robin across the track pool.  Each individual
-// track maintains a low, voice-like cadence while the aggregate throughput
-// scales with track count.  Per-track silence keepalive prevents the SFU
-// from tearing down idle tracks.
+// LINEARIZED TRANSPORT: Each Conn maps to a single dedicated WebRTC track.
+// This guarantees that QUIC datagrams arrive in the exact transmission order,
+// preventing the congestion window collapse caused by sub-transport reordering.
 type Conn struct {
-	localTracks    []*webrtc.TrackLocalStaticSample
-	trackIdx       atomic.Uint32  // round-robin index for WriteFrame
-	trackLastWrite []atomic.Int64 // per-track last-write time (UnixNano)
+	localTrack     *webrtc.TrackLocalStaticSample // Single dedicated track
+	trackLastWrite atomic.Int64                    // Last write time (UnixNano)
 
 	readCh chan []byte
 	buf    []byte
@@ -79,55 +86,33 @@ type Conn struct {
 	bytesRecv atomic.Int64
 }
 
-// New creates a Conn with a single audio track (backward compatible).
+// New creates a Conn bound to exactly ONE audio track.
+// This is the ONLY constructor — multi-track round-robin has been removed
+// because it causes QUIC congestion collapse via sub-transport reordering.
 func New(localTrack *webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
-	return NewMulti([]*webrtc.TrackLocalStaticSample{localTrack}, obfuscator)
-}
-
-// NewMulti creates a Conn with multiple audio tracks for spatial
-// multi-tracking camouflage.  Data frames are round-robin striped across
-// all tracks; each track gets its own silence keepalive.
-func NewMulti(tracks []*webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
 	c := &Conn{
-		localTracks:    tracks,
-		trackLastWrite: make([]atomic.Int64, len(tracks)),
-		readCh:         make(chan []byte, readChSize),
-		done:           make(chan struct{}),
-		obfuscator:     obfuscator,
+		localTrack: localTrack,
+		readCh:     make(chan []byte, readChSize),
+		done:       make(chan struct{}),
+		obfuscator: obfuscator,
 	}
-	now := time.Now().UnixNano()
-	for i := range c.trackLastWrite {
-		c.trackLastWrite[i].Store(now)
-	}
+	c.trackLastWrite.Store(time.Now().UnixNano())
 	if obfuscator != nil && obfuscator.Enabled() {
 		rtpLog.Info("RTP obfuscation enabled (XChaCha20-Poly1305, overhead: %d bytes/pkt)", obfuscator.Overhead())
 	}
-	rtpLog.Info("rtpconn initialized: %d track(s), Opus TOC camouflage active", len(tracks))
+	rtpLog.Info("rtpconn initialized: 1 track (linearized transport, Opus TOC camouflage active)")
 	go c.silenceLoop()
 	return c
 }
 
-// NumTracks returns the number of audio tracks in the pool.
-func (c *Conn) NumTracks() int {
-	return len(c.localTracks)
-}
-
-// nextTrack returns the next track in round-robin order and records the
-// write time for that track.
-func (c *Conn) nextTrack() *webrtc.TrackLocalStaticSample {
-	if len(c.localTracks) == 0 {
-		return nil
-	}
-	idx := int(c.trackIdx.Add(1)-1) % len(c.localTracks)
-	c.trackLastWrite[idx].Store(time.Now().UnixNano())
-	return c.localTracks[idx]
-}
+// NumTracks returns 1 — each Conn is bound to exactly one track.
+// Kept for API compatibility.
+func (c *Conn) NumTracks() int { return 1 }
 
 // silenceLoop fires every 20ms and injects a 3-byte Opus comfort noise frame
-// to EACH track that hasn't received real data in the last 20ms.
+// when no real data was written in the last 20ms.
 //
 // This is non-blocking for data writes — real frames are never queued or delayed.
-// Per-track tracking ensures all tracks in the pool stay alive independently.
 func (c *Conn) silenceLoop() {
 	ticker := time.NewTicker(sampleDuration)
 	defer ticker.Stop()
@@ -140,15 +125,11 @@ func (c *Conn) silenceLoop() {
 			if c.closed.Load() {
 				return
 			}
-			now := time.Now().UnixNano()
-			for i, track := range c.localTracks {
-				last := c.trackLastWrite[i].Load()
-				if now-last >= int64(sampleDuration) {
-					_ = track.WriteSample(media.Sample{
-						Data:     minimalOpusSilence,
-						Duration: sampleDuration,
-					})
-				}
+			if time.Now().UnixNano()-c.trackLastWrite.Load() >= int64(sampleDuration) {
+				_ = c.localTrack.WriteSample(media.Sample{
+					Data:     minimalOpusSilence,
+					Duration: sampleDuration,
+				})
 			}
 		}
 	}
@@ -166,7 +147,7 @@ func (c *Conn) HandleRTP(payload []byte) {
 		return
 	}
 
-	// Phase 1: Strip the Opus TOC container + VBR padding.
+	// Strip the Opus TOC container + VBR padding.
 	data := UnwrapFrame(payload)
 
 	plaintext := data
@@ -213,13 +194,13 @@ func (c *Conn) Read(p []byte) (int, error) {
 
 // Write implements io.Writer (legacy path — not used in QUIC mode).
 // Splits large writes into MTU-safe chunks, wraps each in the Opus TOC
-// container, and round-robins across the track pool.
+// container, and writes to the single dedicated track.
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
 	}
-	if len(c.localTracks) == 0 {
-		return 0, fmt.Errorf("no local tracks")
+	if c.localTrack == nil {
+		return 0, fmt.Errorf("no local track")
 	}
 
 	c.writeMu.Lock()
@@ -227,7 +208,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 	totalLen := len(p)
 	remaining := p
-	chunkSize := 1200
+	chunkSize := 1100
 	if c.obfuscator != nil && c.obfuscator.Enabled() {
 		chunkSize = maxPlainChunkSize
 	}
@@ -248,14 +229,11 @@ func (c *Conn) Write(p []byte) (int, error) {
 			data = encrypted
 		}
 
-		// Phase 1+2: Wrap in Opus TOC container with VBR padding
+		// Wrap in Opus TOC container with VBR padding
 		framed := WrapFrame(data)
 
-		track := c.nextTrack()
-		if track == nil {
-			return 0, fmt.Errorf("no track available")
-		}
-		if err := track.WriteSample(media.Sample{
+		c.trackLastWrite.Store(time.Now().UnixNano())
+		if err := c.localTrack.WriteSample(media.Sample{
 			Data:     framed,
 			Duration: sampleDuration,
 		}); err != nil {
@@ -268,13 +246,13 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 // WriteFrame writes exactly ONE RTP frame INSTANTLY — no queuing, no sleeping.
 //
-// Phase 1+2: The payload is encrypted (if obfuscation is enabled), then wrapped
-// in a valid Opus TOC container with VBR padding before being written to the
-// audio track.  This makes every data frame parse as a valid Opus audio sample
-// to DPI inspection, with variable-length padding disrupting size analysis.
+// The payload is encrypted (if obfuscation is enabled), then wrapped in a valid
+// Opus TOC container with VBR padding before being written to the SINGLE
+// dedicated audio track.
 //
-// Phase 3: Frames are round-robin striped across the track pool so each
-// individual track maintains a low, voice-like cadence.
+// LINEARIZED: Writes go directly to the single bound track, preserving the
+// exact packet sequence that QUIC expects.  This prevents the congestion
+// window collapse caused by sub-transport reordering across multiple tracks.
 //
 // Speed design: QUIC calls WriteTo (which calls WriteFrame) as fast as its
 // congestion window allows. Pion's WriteSample increments the RTP timestamp
@@ -284,8 +262,8 @@ func (c *Conn) WriteFrame(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
 	}
-	if len(c.localTracks) == 0 {
-		return 0, fmt.Errorf("no local tracks")
+	if c.localTrack == nil {
+		return 0, fmt.Errorf("no local track")
 	}
 
 	data := p
@@ -297,17 +275,14 @@ func (c *Conn) WriteFrame(p []byte) (int, error) {
 		data = encrypted
 	}
 
-	// Phase 1+2: Wrap in Opus TOC container with VBR padding
+	// Wrap in Opus TOC container with VBR padding
 	framed := WrapFrame(data)
 
-	// Phase 3: Round-robin across the track pool
-	track := c.nextTrack()
-	if track == nil {
-		return 0, fmt.Errorf("no track available")
-	}
+	// Update activity timer for silence keepalive
+	c.trackLastWrite.Store(time.Now().UnixNano())
 
-	// WRITE INSTANTLY — Pion fakes the RTP timestamp from Duration
-	if err := track.WriteSample(media.Sample{
+	// Write directly to the single isolated track — preserves packet sequence ordering
+	if err := c.localTrack.WriteSample(media.Sample{
 		Data:     framed,
 		Duration: sampleDuration, // Pion adds 960 RTP samples per call
 	}); err != nil {
