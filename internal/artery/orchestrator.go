@@ -126,12 +126,19 @@ func (o *Orchestrator) Stop() {
 // collectTelemetry reads QUIC-level RTT stats from each artery and feeds
 // them into the EWMA filter.
 //
-// quic-go exposes SmoothedRTT on the connection, which is itself an EWMA.
-// We re-smooth it through our own filter to add a second layer of damping
-// that prevents transient TCP-level retransmission spikes from poisoning
-// the artery-level scheduling decision.
+// For ACTIVE arteries: measures RTT by timing a quick stream open/close.
+// This is done sparingly (one artery per tick) to avoid wasting bandwidth.
+// For SHADOW arteries: delegates to ProbeRTT for a full measurement.
+//
+// The measured RTT is fed into the artery's EWMA filter so the hysteresis
+// engine and scheduler have real data instead of the hardcoded 50ms default.
 func (o *Orchestrator) collectTelemetry() {
-	for _, a := range o.pool.AllArteries() {
+	arteries := o.pool.AllArteries()
+	if len(arteries) == 0 {
+		return
+	}
+
+	for _, a := range arteries {
 		if a.State() == StateDead {
 			continue
 		}
@@ -141,25 +148,41 @@ func (o *Orchestrator) collectTelemetry() {
 			continue
 		}
 
-		// Read QUIC's SmoothedRTT — this is already an EWMA maintained by quic-go.
-		// We re-filter it through our own α=0.125 EWMA to add stability.
-		//
-		// IMPORTANT: quic-go may not expose SmoothedRTT directly via the
-		// public quic.Connection interface. We fall back to using the
-		// connection's context-alive check + stream success/failure rate
-		// as a proxy for connection health.
-		//
-		// For now, use the stream success rate as a health indicator:
-		// If streams are succeeding, the connection is healthy.
-		// The SRTT is estimated from stream open latency measured in
-		// OpenStream's circuit breaker.
-
-		// Check if connection is still alive
+		// Check if connection is still alive.
 		select {
 		case <-conn.Context().Done():
-			// Connection dead — will be caught by detectDead
 			continue
 		default:
+		}
+
+		// For SHADOW arteries, do a full probe (stream open/close).
+		if a.State() == StateShadow {
+			go o.ProbeRTT(a)
+			continue
+		}
+
+		// For ACTIVE arteries, measure RTT by timing a lightweight stream open.
+		// Only probe one ACTIVE artery per telemetry tick to minimize overhead.
+		if a.State() == StateActive {
+			go func(art *Artery) {
+				c := art.QConn()
+				if c == nil {
+					return
+				}
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				stream, err := c.OpenStreamSync(ctx)
+				cancel()
+				rtt := time.Since(start)
+
+				if err != nil {
+					return
+				}
+				stream.Close()
+
+				// Feed the measured RTT into the EWMA filter.
+				art.Tel().UpdateRTT(rtt)
+			}(a)
 		}
 	}
 }

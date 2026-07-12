@@ -145,7 +145,7 @@ func (re *RoutingEngine) classifyAndRelay(targetAddr string, localConn net.Conn,
 	// If the host is a domain (not a literal IP), resolve it strictly through
 	// the application DNS roots for classification.
 	if ip := net.ParseIP(host); ip == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		re.mu.RLock()
 		resolver := re.resolver
 		re.mu.RUnlock()
@@ -225,7 +225,7 @@ func (re *RoutingEngine) classifyHTTPPlain(host, reqLine string, localConn net.C
 	resolvedHost := host
 
 	if ip := net.ParseIP(classifyHost); ip == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		re.mu.RLock()
 		resolver := re.resolver
 		re.mu.RUnlock()

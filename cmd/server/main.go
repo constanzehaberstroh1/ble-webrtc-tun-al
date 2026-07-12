@@ -867,13 +867,20 @@ func handleQUICStream(stream quic.Stream) {
 	targetAddr := string(addrBuf)
 	mainLog.Info("[QUIC-Stream] Proxying to %s", targetAddr)
 
-	// Dial the target
-	remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	// Dial the target with reduced timeout (5s instead of 10s for faster failure).
+	remote, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 	if err != nil {
 		mainLog.Info("[QUIC-Stream] dial %s: %v", targetAddr, err)
 		return
 	}
 	defer remote.Close()
+
+	// TCP_NODELAY: disable Nagle's algorithm on the outbound connection so
+	// responses (especially small initial HTTP responses, TLS alerts, etc.)
+	// are sent immediately without 40ms coalescing delay.
+	if tc, ok := remote.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 
 	// Bidirectional relay
 	done := make(chan struct{}, 2)

@@ -2,6 +2,7 @@ package artery
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,10 @@ type Telemetry struct {
 	// Promotion stability tracking: counts consecutive windows where
 	// metrics are within the promotion threshold.
 	promotionStreak int
+
+	// Total streams ever assigned to this artery (for WRR weight tracking).
+	// Atomic — no lock needed.
+	totalStreams atomic.Int64
 }
 
 // lossBucket records success/failure counts for a time slot.
@@ -242,4 +247,17 @@ func (t *Telemetry) PacketLossUnlocked() float64 {
 		return 0
 	}
 	return float64(totalFailure) / float64(total)
+}
+
+// ── Total Stream Counter ───────────────────────────────────────────────
+
+// IncrementTotalStreams atomically increments the total stream counter.
+// Called every time a stream is assigned to this artery's connection.
+func (t *Telemetry) IncrementTotalStreams() {
+	t.totalStreams.Add(1)
+}
+
+// TotalStreams returns the total number of streams ever assigned.
+func (t *Telemetry) TotalStreams() int64 {
+	return t.totalStreams.Load()
 }

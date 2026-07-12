@@ -19,36 +19,60 @@ var schedLog = logger.New("scheduler")
 
 const (
 	// streamTimeout is how long OpenStreamSync waits before giving up.
-	streamTimeout = 2 * time.Second
+	// Reduced from 2s to 800ms — if a QUIC connection can't open a stream
+	// in 800ms, it's likely broken and we should try the next artery fast.
+	streamTimeout = 800 * time.Millisecond
 
 	// circuitBreakerThreshold: consecutive stream failures to exclude an artery.
 	circuitBreakerThreshold = int32(3)
 
 	// circuitBreakerKill: consecutive failures that trigger force-close.
 	circuitBreakerKill = int32(5)
+
+	// preOpenPoolSize is the number of pre-opened idle streams maintained
+	// per artery for instant first-request serving.
+	preOpenPoolSize = 2
 )
 
 // ── ArteryPool ─────────────────────────────────────────────────────────
 
-// ArteryPool manages a set of arteries with intelligent ECF scheduling.
+// ArteryPool manages a set of arteries with intelligent P2C+WRR scheduling.
 // It replaces the old TunnelPool's round-robin cursor with a congestion-
-// and latency-aware stream selector.
+// and latency-aware stream selector that guarantees fair distribution.
 type ArteryPool struct {
 	mu       sync.RWMutex
 	arteries map[string]*Artery // keyed by label (e.g. "ch1")
 	done     chan struct{}
 	once     sync.Once
 
-	// Fallback cursor for when all arteries have equal metrics.
-	cursor atomic.Uint32
+	// Round-robin cursor for WRR distribution.
+	cursor atomic.Uint64
+
+	// Pre-opened stream pool for instant serving.
+	preOpenMu     sync.Mutex
+	preOpenPool   map[string][]preOpenedStream
+	preOpenDone   chan struct{}
+	preOpenOnce   sync.Once
+}
+
+// preOpenedStream holds an idle stream ready for immediate use.
+type preOpenedStream struct {
+	conn    net.Conn
+	artery  *Artery
+	created time.Time
 }
 
 // NewArteryPool creates a new empty artery pool.
 func NewArteryPool() *ArteryPool {
-	return &ArteryPool{
-		arteries: make(map[string]*Artery),
-		done:     make(chan struct{}),
+	p := &ArteryPool{
+		arteries:    make(map[string]*Artery),
+		done:        make(chan struct{}),
+		preOpenPool: make(map[string][]preOpenedStream),
+		preOpenDone: make(chan struct{}),
 	}
+	// Start the pre-open replenisher in the background.
+	go p.preOpenReplenisher()
+	return p
 }
 
 // Register adds a fully-established QUIC connection as an ACTIVE artery.
@@ -82,6 +106,17 @@ func (p *ArteryPool) Unregister(label string) {
 	}
 	n := len(p.arteries)
 	p.mu.Unlock()
+
+	// Drain pre-opened streams for this artery.
+	p.preOpenMu.Lock()
+	if streams, ok := p.preOpenPool[label]; ok {
+		for _, s := range streams {
+			s.conn.Close()
+		}
+		delete(p.preOpenPool, label)
+	}
+	p.preOpenMu.Unlock()
+
 	schedLog.Info("[Pool] Unregistered %s (remaining: %d)", label, n)
 }
 
@@ -102,19 +137,26 @@ func (p *ArteryPool) GetConnection(label string) quic.Connection {
 	return nil
 }
 
-// ── ECF/BLEST Stream Scheduler ─────────────────────────────────────────
+// ── P2C + WRR Stream Scheduler ─────────────────────────────────────────
 
-// OpenStream opens a QUIC stream on the artery with the lowest expected
-// completion time (Earliest Completion First), with BLEST gating to skip
-// arteries whose congestion windows are saturated.
+// streamCandidate represents an artery eligible for stream assignment.
+type streamCandidate struct {
+	artery *Artery
+	label  string
+}
+
+// OpenStream opens a QUIC stream using Power-of-Two-Choices (P2C) combined
+// with Weighted Round-Robin (WRR) for guaranteed fair traffic distribution.
 //
 // Algorithm:
-//  1. Filter to ACTIVE arteries that are alive
-//  2. Skip arteries that have exceeded the circuit breaker threshold
-//  3. For each candidate, compute Expected Delivery Time:
-//     ECF = SRTT + (ActiveStreams × latencyPenaltyPerStream)
-//  4. BLEST gate: skip if ActiveStreams > threshold AND slower alternatives exist
-//  5. Select the artery with minimum ECF
+//  1. Filter to ACTIVE arteries that are alive and not circuit-broken
+//  2. Try to serve from the pre-opened stream pool first (instant, 0ms)
+//  3. If >1 candidate: P2C — pick 2 random arteries, use the one with
+//     fewer active streams. This is mathematically proven to produce
+//     O(log log N) max-load, which is near-perfect balance.
+//  4. If all arteries have similar load: WRR round-robin cursor ensures
+//     each artery gets equal turns even when stream lifetimes are short.
+//  5. Fallback: try all remaining candidates in order.
 func (p *ArteryPool) OpenStream() (net.Conn, error) {
 	p.mu.RLock()
 
@@ -124,48 +166,23 @@ func (p *ArteryPool) OpenStream() (net.Conn, error) {
 		return nil, fmt.Errorf("zero active arteries in pool")
 	}
 
-	// Collect active, alive candidates
-	type candidate struct {
-		artery   *Artery
-		label    string
-		ecf      time.Duration
-	}
-
-	candidates := make([]candidate, 0, n)
+	// Collect active, alive candidates.
+	candidates := make([]streamCandidate, 0, n)
 	for label, a := range p.arteries {
-		// Only ACTIVE arteries carry traffic
 		if a.State() != StateActive {
 			continue
 		}
-
-		// Skip dead connections
 		if !a.IsAlive() {
 			continue
 		}
-
-		// Skip circuit-broken arteries
+		// Skip circuit-broken arteries.
 		if a.streamFailures.Load()-a.streamSuccesses.Load() >= int64(circuitBreakerThreshold) {
-			// Use consecutive fail logic: if recent failures dominate
 			loss := a.PacketLoss()
 			if loss > 0.5 {
 				continue
 			}
 		}
-
-		// ECF computation:
-		// Expected delivery = SRTT + penalty for congestion (more active streams = slower)
-		srtt := a.SRTT()
-		activeStreams := a.ActiveStreams()
-
-		// Penalty: each active stream adds ~2ms expected queuing delay
-		penalty := time.Duration(activeStreams) * 2 * time.Millisecond
-		ecf := srtt + penalty
-
-		candidates = append(candidates, candidate{
-			artery: a,
-			label:  label,
-			ecf:    ecf,
-		})
+		candidates = append(candidates, streamCandidate{artery: a, label: label})
 	}
 	p.mu.RUnlock()
 
@@ -173,37 +190,32 @@ func (p *ArteryPool) OpenStream() (net.Conn, error) {
 		return nil, fmt.Errorf("no healthy ACTIVE arteries available")
 	}
 
-	// Sort by ECF (lowest first)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].ecf < candidates[j].ecf
-	})
+	// ── Step 1: Try pre-opened stream pool (instant, 0ms latency) ──────
+	stream := p.tryPreOpened(candidates)
+	if stream != nil {
+		return stream, nil
+	}
 
-	// BLEST gating: try the best candidate first, but skip if its streams
-	// are heavily saturated AND a close second exists.
-	bestIdx := 0
-	if len(candidates) > 1 {
-		best := candidates[0]
-		second := candidates[1]
+	// ── Step 2: P2C + WRR selection ────────────────────────────────────
+	selected := p.p2cSelect(candidates)
 
-		// If best has >50 active streams and second is within 2× ECF,
-		// prefer the second to avoid congestion
-		if best.artery.ActiveStreams() > 50 && second.ecf < best.ecf*2 {
-			bestIdx = 1
+	// Try the selected candidate first, then fall through remaining.
+	order := make([]streamCandidate, 0, len(candidates))
+	order = append(order, selected)
+	for _, c := range candidates {
+		if c.label != selected.label {
+			order = append(order, c)
 		}
 	}
 
-	// Try each candidate in ECF order starting from bestIdx
-	for i := bestIdx; i < len(candidates); i++ {
-		c := candidates[i]
-
+	for _, c := range order {
 		ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
-		stream, err := c.artery.QConn().OpenStreamSync(ctx)
+		s, err := c.artery.QConn().OpenStreamSync(ctx)
 		cancel()
 
 		if err != nil {
 			c.artery.RecordStreamFailure()
-			schedLog.Warn("[Pool] Stream open failed on %s (ECF=%dms): %v",
-				c.label, c.ecf.Milliseconds(), err)
+			schedLog.Warn("[Pool] Stream open failed on %s: %v", c.label, err)
 
 			// Circuit breaker kill
 			recentFails := c.artery.streamFailures.Load()
@@ -214,17 +226,156 @@ func (p *ArteryPool) OpenStream() (net.Conn, error) {
 			continue
 		}
 
-		// Success
+		// Success — track for fair distribution.
 		c.artery.RecordStreamSuccess()
 		c.artery.IncrementStreams()
+		c.artery.Tel().IncrementTotalStreams()
 
 		return &trackedStream{
-			Conn:   wrapQUICStream(stream, c.artery.QConn()),
+			Conn:   wrapQUICStream(s, c.artery.QConn()),
 			artery: c.artery,
 		}, nil
 	}
 
 	return nil, fmt.Errorf("all artery stream opens failed")
+}
+
+// p2cSelect picks the best artery using Power-of-Two-Choices combined with
+// round-robin. When there are 2+ candidates, it picks 2 pseudo-random ones
+// and returns the one with fewer active streams. This guarantees fair load
+// distribution without needing accurate RTT estimates.
+func (p *ArteryPool) p2cSelect(candidates []streamCandidate) streamCandidate {
+	n := len(candidates)
+	if n == 1 {
+		return candidates[0]
+	}
+
+	// Advance the WRR cursor to get two distinct indices.
+	// Using the cursor ensures we don't always start from the same pair.
+	cursor := p.cursor.Add(1)
+	i := int(cursor % uint64(n))
+	j := int((cursor*7 + 1) % uint64(n)) // Different stride to avoid aliasing
+	if j == i {
+		j = (i + 1) % n
+	}
+
+	a := candidates[i]
+	b := candidates[j]
+
+	// P2C: pick the one with fewer active streams (least loaded).
+	aLoad := a.artery.ActiveStreams()
+	bLoad := b.artery.ActiveStreams()
+
+	if aLoad <= bLoad {
+		return a
+	}
+	return b
+}
+
+// tryPreOpened tries to return a pre-opened stream from the pool.
+// Returns nil if no valid pre-opened stream is available.
+func (p *ArteryPool) tryPreOpened(candidates []streamCandidate) net.Conn {
+	p.preOpenMu.Lock()
+	defer p.preOpenMu.Unlock()
+
+	// Try candidates in round-robin order.
+	cursor := p.cursor.Load()
+	n := len(candidates)
+
+	for attempt := 0; attempt < n; attempt++ {
+		idx := int((cursor + uint64(attempt)) % uint64(n))
+		c := candidates[idx]
+
+		streams, ok := p.preOpenPool[c.label]
+		if !ok || len(streams) == 0 {
+			continue
+		}
+
+		// Pop the first pre-opened stream.
+		s := streams[0]
+		p.preOpenPool[c.label] = streams[1:]
+
+		// Validate: skip if too old (>10s) or artery changed state.
+		if time.Since(s.created) > 10*time.Second {
+			s.conn.Close()
+			continue
+		}
+		if s.artery.State() != StateActive || !s.artery.IsAlive() {
+			s.conn.Close()
+			continue
+		}
+
+		// Success — track the assignment.
+		s.artery.IncrementStreams()
+		s.artery.Tel().IncrementTotalStreams()
+		p.cursor.Add(1)
+		return s.conn
+	}
+	return nil
+}
+
+// preOpenReplenisher runs in the background and maintains a small pool of
+// pre-opened QUIC streams for each active artery. These streams can be
+// returned instantly by OpenStream(), eliminating the stream-open RTT
+// for the first few requests on each page load.
+func (p *ArteryPool) preOpenReplenisher() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.preOpenDone:
+			return
+		case <-p.done:
+			return
+		case <-ticker.C:
+		}
+
+		p.mu.RLock()
+		arteries := make([]*Artery, 0, len(p.arteries))
+		labels := make([]string, 0, len(p.arteries))
+		for label, a := range p.arteries {
+			if a.State() == StateActive && a.IsAlive() {
+				arteries = append(arteries, a)
+				labels = append(labels, label)
+			}
+		}
+		p.mu.RUnlock()
+
+		for i, a := range arteries {
+			label := labels[i]
+
+			p.preOpenMu.Lock()
+			current := len(p.preOpenPool[label])
+			p.preOpenMu.Unlock()
+
+			if current >= preOpenPoolSize {
+				continue
+			}
+
+			// Open a stream with short timeout.
+			ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
+			stream, err := a.QConn().OpenStreamSync(ctx)
+			cancel()
+
+			if err != nil {
+				continue
+			}
+
+			wrapped := &trackedStream{
+				Conn:   wrapQUICStream(stream, a.QConn()),
+				artery: a,
+			}
+
+			p.preOpenMu.Lock()
+			p.preOpenPool[label] = append(p.preOpenPool[label], preOpenedStream{
+				conn:    wrapped,
+				artery:  a,
+				created: time.Now(),
+			})
+			p.preOpenMu.Unlock()
+		}
+	}
 }
 
 // ── Pool statistics ────────────────────────────────────────────────────

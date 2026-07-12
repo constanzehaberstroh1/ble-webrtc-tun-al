@@ -1350,13 +1350,18 @@ func startSOCKS5(ctx context.Context, addr string, p *pool.TunnelPool, re *Routi
 			}
 			continue
 		}
+		// TCP_NODELAY: disable Nagle's algorithm to eliminate 40ms delay
+		// on small SOCKS5 handshake packets. Critical for perceived latency.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
 		go handleSOCKS5(conn, p, re)
 	}
 }
 
 func handleSOCKS5(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// 1. Greeting
 	buf := make([]byte, 258)
@@ -1439,13 +1444,17 @@ func startHTTPProxy(ctx context.Context, addr string, p *pool.TunnelPool, re *Ro
 			}
 			continue
 		}
+		// TCP_NODELAY: disable Nagle's algorithm for HTTP proxy connections.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
 		go handleHTTPProxy(conn, p, re)
 	}
 }
 
 func handleHTTPProxy(conn net.Conn, p *pool.TunnelPool, re *RoutingEngine) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
