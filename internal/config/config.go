@@ -152,12 +152,12 @@ type Config struct {
 	Role string // "client" or "server"
 
 	// Bale signaling
-	BaleAccessToken   string
-	BaleTargetUserID  int64
+	BaleAccessToken  string
+	BaleTargetUserID int64
 
 	// LiveKit / Bale signaling
-	LiveKitWSURL      string
-	LiveKitToken      string
+	LiveKitWSURL string
+	LiveKitToken string
 
 	// ICE / TURN servers
 	TURNServerPrimary   string
@@ -178,11 +178,17 @@ type Config struct {
 
 	// Admin panel (server only)
 	AdminListenAddr string
-	AdminUsername    string
+	AdminUsername   string
 	AdminPassword   string
 
 	// Obfuscation (anti-DPI)
 	ObfuscationSecret string
+
+	// Number of Opus audio tracks for spatial multi-tracking camouflage.
+	// Data is striped round-robin across N tracks so each individual track
+	// maintains a low, voice-like bandwidth profile while the aggregate
+	// throughput scales.  Default 3.
+	NumTracks int
 
 	// Logging
 	LogLevel string
@@ -217,10 +223,12 @@ func Load() (*Config, error) {
 		SignalServerAddr: getEnv("SIGNAL_SERVER_ADDR", ""),
 
 		AdminListenAddr: getEnv("ADMIN_LISTEN_ADDR", ":8080"),
-		AdminUsername:    getEnv("ADMIN_USERNAME", "admin"),
-		AdminPassword:    getEnv("ADMIN_PASSWORD", "changeme"),
+		AdminUsername:   getEnv("ADMIN_USERNAME", "admin"),
+		AdminPassword:   getEnv("ADMIN_PASSWORD", "changeme"),
 
 		ObfuscationSecret: getEnv("OBFUSCATION_SECRET", ""),
+
+		NumTracks: getEnvInt("BLE_TUNNEL_TRACKS", 3),
 
 		LogLevel: getEnv("LOG_LEVEL", "info"),
 	}

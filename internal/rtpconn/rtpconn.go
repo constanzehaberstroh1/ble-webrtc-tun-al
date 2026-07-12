@@ -2,14 +2,14 @@
 //
 // SPEED ARCHITECTURE (post-pacer removal):
 //
-//   WriteFrame() → WriteSample() immediately (no sleep, no queue)
-//                  Pion internally increments RTP timestamp by 960 per call,
-//                  so the SFU sees perfectly spaced logical timestamps even
-//                  when packets arrive physically back-to-back.
+//	WriteFrame() → WriteSample() immediately (no sleep, no queue)
+//	               Pion internally increments RTP timestamp by 960 per call,
+//	               so the SFU sees perfectly spaced logical timestamps even
+//	               when packets arrive physically back-to-back.
 //
-//   silenceLoop() → fires every 20ms, but ONLY injects a 3-byte comfort noise
-//                  frame when no real data was written in the last 20ms.
-//                  This keeps the Opus track alive without blocking data writes.
+//	silenceLoop() → fires every 20ms, but ONLY injects a 3-byte comfort noise
+//	               frame when no real data was written in the last 20ms.
+//	               This keeps the Opus track alive without blocking data writes.
 //
 // Result: QUIC can blast packets at full link speed. The SFU sees valid RTP
 // timestamps (it checks timestamps, not wall-clock arrival rate). The track
@@ -48,23 +48,28 @@ const (
 // Sent when the track is idle to prevent the SFU from tearing it down.
 var minimalOpusSilence = []byte{0xF8, 0xFF, 0xFE}
 
-// Conn wraps a Pion local audio track and an RTP receive channel.
+// Conn wraps one or more Pion local audio tracks and an RTP receive channel.
 // It exposes WriteFrame/ReadPacket for quic-go's OpusPacketConn bridge,
 // and the legacy Read/Write interface for backward compatibility.
+//
+// Phase 3 — Spatial Multi-Tracking: when multiple tracks are provided, data
+// frames are striped round-robin across the track pool.  Each individual
+// track maintains a low, voice-like cadence while the aggregate throughput
+// scales with track count.  Per-track silence keepalive prevents the SFU
+// from tearing down idle tracks.
 type Conn struct {
-	localTrack *webrtc.TrackLocalStaticSample
-	readCh     chan []byte
-	buf        []byte
-	closed     atomic.Bool
-	once       sync.Once
-	done       chan struct{}
+	localTracks    []*webrtc.TrackLocalStaticSample
+	trackIdx       atomic.Uint32  // round-robin index for WriteFrame
+	trackLastWrite []atomic.Int64 // per-track last-write time (UnixNano)
+
+	readCh chan []byte
+	buf    []byte
+	closed atomic.Bool
+	once   sync.Once
+	done   chan struct{}
 
 	// Obfuscation (XChaCha20-Poly1305)
 	obfuscator *dcconn.Obfuscator
-
-	// lastWrite tracks the last time real data was sent (UnixNano).
-	// silenceLoop uses this to decide whether to inject a keepalive frame.
-	lastWrite atomic.Int64
 
 	// writeMu serialises legacy Write() calls only.
 	// WriteFrame() is already called from a single quic-go goroutine per stream.
@@ -74,28 +79,55 @@ type Conn struct {
 	bytesRecv atomic.Int64
 }
 
-// New creates a Conn and starts the silence keepalive loop.
-// The pacer queue has been removed — WriteFrame() writes instantly.
+// New creates a Conn with a single audio track (backward compatible).
 func New(localTrack *webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
+	return NewMulti([]*webrtc.TrackLocalStaticSample{localTrack}, obfuscator)
+}
+
+// NewMulti creates a Conn with multiple audio tracks for spatial
+// multi-tracking camouflage.  Data frames are round-robin striped across
+// all tracks; each track gets its own silence keepalive.
+func NewMulti(tracks []*webrtc.TrackLocalStaticSample, obfuscator *dcconn.Obfuscator) *Conn {
 	c := &Conn{
-		localTrack: localTrack,
-		readCh:     make(chan []byte, readChSize),
-		done:       make(chan struct{}),
-		obfuscator: obfuscator,
+		localTracks:    tracks,
+		trackLastWrite: make([]atomic.Int64, len(tracks)),
+		readCh:         make(chan []byte, readChSize),
+		done:           make(chan struct{}),
+		obfuscator:     obfuscator,
 	}
-	c.lastWrite.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	for i := range c.trackLastWrite {
+		c.trackLastWrite[i].Store(now)
+	}
 	if obfuscator != nil && obfuscator.Enabled() {
 		rtpLog.Info("RTP obfuscation enabled (XChaCha20-Poly1305, overhead: %d bytes/pkt)", obfuscator.Overhead())
 	}
+	rtpLog.Info("rtpconn initialized: %d track(s), Opus TOC camouflage active", len(tracks))
 	go c.silenceLoop()
 	return c
 }
 
+// NumTracks returns the number of audio tracks in the pool.
+func (c *Conn) NumTracks() int {
+	return len(c.localTracks)
+}
+
+// nextTrack returns the next track in round-robin order and records the
+// write time for that track.
+func (c *Conn) nextTrack() *webrtc.TrackLocalStaticSample {
+	if len(c.localTracks) == 0 {
+		return nil
+	}
+	idx := int(c.trackIdx.Add(1)-1) % len(c.localTracks)
+	c.trackLastWrite[idx].Store(time.Now().UnixNano())
+	return c.localTracks[idx]
+}
+
 // silenceLoop fires every 20ms and injects a 3-byte Opus comfort noise frame
-// ONLY when no real data has been written in the last 20ms.
+// to EACH track that hasn't received real data in the last 20ms.
 //
 // This is non-blocking for data writes — real frames are never queued or delayed.
-// The SFU track stays alive during idle periods without capping throughput.
+// Per-track tracking ensures all tracks in the pool stay alive independently.
 func (c *Conn) silenceLoop() {
 	ticker := time.NewTicker(sampleDuration)
 	defer ticker.Stop()
@@ -109,33 +141,39 @@ func (c *Conn) silenceLoop() {
 				return
 			}
 			now := time.Now().UnixNano()
-			last := c.lastWrite.Load()
-			// Only inject silence if no real write happened in the last 20ms
-			if now-last >= int64(sampleDuration) {
-				_ = c.localTrack.WriteSample(media.Sample{
-					Data:     minimalOpusSilence,
-					Duration: sampleDuration,
-				})
+			for i, track := range c.localTracks {
+				last := c.trackLastWrite[i].Load()
+				if now-last >= int64(sampleDuration) {
+					_ = track.WriteSample(media.Sample{
+						Data:     minimalOpusSilence,
+						Duration: sampleDuration,
+					})
+				}
 			}
 		}
 	}
 }
 
 // HandleRTP is called from the OnTrack ReadRTP loop.
-// Decrypts the payload and delivers it to ReadPacket/Read.
+// Strips the Opus TOC container, decrypts the payload, and delivers it
+// to ReadPacket/Read.
 func (c *Conn) HandleRTP(payload []byte) {
 	if c.closed.Load() || len(payload) == 0 {
 		return
 	}
+	// Skip the 3-byte Opus DTX silence keepalive frame.
 	if isOpusSilence(payload) {
 		return
 	}
 
-	plaintext := payload
+	// Phase 1: Strip the Opus TOC container + VBR padding.
+	data := UnwrapFrame(payload)
+
+	plaintext := data
 	if c.obfuscator != nil && c.obfuscator.Enabled() {
-		decrypted, err := c.obfuscator.Decrypt(payload)
+		decrypted, err := c.obfuscator.Decrypt(data)
 		if err != nil {
-			plaintext = payload
+			plaintext = data
 		} else {
 			plaintext = decrypted
 		}
@@ -174,13 +212,14 @@ func (c *Conn) Read(p []byte) (int, error) {
 }
 
 // Write implements io.Writer (legacy path — not used in QUIC mode).
-// Splits large writes into MTU-safe chunks.
+// Splits large writes into MTU-safe chunks, wraps each in the Opus TOC
+// container, and round-robins across the track pool.
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
 	}
-	if c.localTrack == nil {
-		return 0, fmt.Errorf("no local track")
+	if len(c.localTracks) == 0 {
+		return 0, fmt.Errorf("no local tracks")
 	}
 
 	c.writeMu.Lock()
@@ -209,9 +248,15 @@ func (c *Conn) Write(p []byte) (int, error) {
 			data = encrypted
 		}
 
-		c.lastWrite.Store(time.Now().UnixNano())
-		if err := c.localTrack.WriteSample(media.Sample{
-			Data:     data,
+		// Phase 1+2: Wrap in Opus TOC container with VBR padding
+		framed := WrapFrame(data)
+
+		track := c.nextTrack()
+		if track == nil {
+			return 0, fmt.Errorf("no track available")
+		}
+		if err := track.WriteSample(media.Sample{
+			Data:     framed,
 			Duration: sampleDuration,
 		}); err != nil {
 			return 0, fmt.Errorf("write sample: %w", err)
@@ -223,19 +268,24 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 // WriteFrame writes exactly ONE RTP frame INSTANTLY — no queuing, no sleeping.
 //
+// Phase 1+2: The payload is encrypted (if obfuscation is enabled), then wrapped
+// in a valid Opus TOC container with VBR padding before being written to the
+// audio track.  This makes every data frame parse as a valid Opus audio sample
+// to DPI inspection, with variable-length padding disrupting size analysis.
+//
+// Phase 3: Frames are round-robin striped across the track pool so each
+// individual track maintains a low, voice-like cadence.
+//
 // Speed design: QUIC calls WriteTo (which calls WriteFrame) as fast as its
 // congestion window allows. Pion's WriteSample increments the RTP timestamp
 // by 960 on every call (48kHz × 20ms), so the SFU sees a perfectly spaced
 // logical timestamp sequence even when physical arrival is back-to-back.
-//
-// The SFU checks logical RTP timestamps, not physical wall-clock arrival time,
-// so this bypasses the audio policer's pps limit without triggering drops.
 func (c *Conn) WriteFrame(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, fmt.Errorf("connection closed")
 	}
-	if c.localTrack == nil {
-		return 0, fmt.Errorf("no local track")
+	if len(c.localTracks) == 0 {
+		return 0, fmt.Errorf("no local tracks")
 	}
 
 	data := p
@@ -247,12 +297,18 @@ func (c *Conn) WriteFrame(p []byte) (int, error) {
 		data = encrypted
 	}
 
-	// Update activity time so silenceLoop doesn't inject a keepalive this tick
-	c.lastWrite.Store(time.Now().UnixNano())
+	// Phase 1+2: Wrap in Opus TOC container with VBR padding
+	framed := WrapFrame(data)
+
+	// Phase 3: Round-robin across the track pool
+	track := c.nextTrack()
+	if track == nil {
+		return 0, fmt.Errorf("no track available")
+	}
 
 	// WRITE INSTANTLY — Pion fakes the RTP timestamp from Duration
-	if err := c.localTrack.WriteSample(media.Sample{
-		Data:     data,
+	if err := track.WriteSample(media.Sample{
+		Data:     framed,
 		Duration: sampleDuration, // Pion adds 960 RTP samples per call
 	}); err != nil {
 		return 0, err

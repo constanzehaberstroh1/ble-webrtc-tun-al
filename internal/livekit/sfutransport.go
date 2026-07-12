@@ -41,9 +41,10 @@ type SFUTransport struct {
 	conn *websocket.Conn
 	mu   sync.RWMutex
 
-	pubPC *webrtc.PeerConnection // publisher PC
-	subPC *webrtc.PeerConnection // subscriber PC
-	track *webrtc.TrackLocalStaticSample
+	pubPC     *webrtc.PeerConnection           // publisher PC
+	subPC     *webrtc.PeerConnection           // subscriber PC
+	tracks    []*webrtc.TrackLocalStaticSample // Opus track pool (multi-track camouflage)
+	numTracks int                              // configured track count for camouflage
 
 	// DataChannel for tunnel data - reliable/ordered SCTP (fallback)
 	pubDC    *webrtc.DataChannel // publisher _reliable data channel
@@ -83,7 +84,13 @@ type SFUTransport struct {
 
 // NewSFUTransport creates a transport that routes through the LiveKit SFU.
 // If obfuscator is nil, a passthrough (disabled) obfuscator is used.
+// The number of audio tracks is taken from cfg.NumTracks (default 3 for
+// spatial multi-tracking camouflage).
 func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTransport {
+	numTracks := 3
+	if cfg != nil && cfg.NumTracks > 0 {
+		numTracks = cfg.NumTracks
+	}
 	s := &SFUTransport{
 		cfg:              cfg,
 		obfuscator:       obfuscator,
@@ -91,9 +98,11 @@ func NewSFUTransport(cfg *config.Config, obfuscator *dcconn.Obfuscator) *SFUTran
 		done:             make(chan struct{}),
 		dcReady:          make(chan struct{}),
 		subOfferCh:       make(chan struct{}, 1),
-		trackPublishedCh: make(chan struct{}, 1),
+		trackPublishedCh: make(chan struct{}, numTracks),
+		numTracks:        numTracks,
 	}
 	s.lastPongTime.Store(time.Now().UnixMilli())
+	sfuLog.Info("SFU transport: %d audio track(s) configured", numTracks)
 	return s
 }
 
@@ -147,40 +156,49 @@ func (s *SFUTransport) Connect(ctx context.Context) error {
 	// 6. Start message reader
 	go s.readMessages(ctx)
 
-	// 7. Tell the SFU about our track BEFORE publishing (required by LiveKit)
-	// Use AUDIO track (Opus) — DPI sees a normal voice call
-	sfuLog.Info("Sending AddTrack request (Opus audio)...")
-	addTrackReq := &lkproto.SignalRequest{
-		Message: &lkproto.SignalRequest_AddTrack{
-			AddTrack: &lkproto.AddTrackRequest{
-				Cid:    s.track.ID(),
-				Name:   "audio",
-				Type:   lkproto.TrackType_AUDIO,
-				Source: lkproto.TrackSource_MICROPHONE,
+	// 7. Tell the SFU about ALL tracks BEFORE publishing (required by LiveKit)
+	// Use AUDIO tracks (Opus) — DPI sees a normal voice call with multiple lines
+	for i, track := range s.tracks {
+		sfuLog.Info("Sending AddTrack request %d/%d (Opus audio)...", i+1, len(s.tracks))
+		addTrackReq := &lkproto.SignalRequest{
+			Message: &lkproto.SignalRequest_AddTrack{
+				AddTrack: &lkproto.AddTrackRequest{
+					Cid:    track.ID(),
+					Name:   fmt.Sprintf("audio-%d", i),
+					Type:   lkproto.TrackType_AUDIO,
+					Source: lkproto.TrackSource_MICROPHONE,
+				},
 			},
-		},
-	}
-	if err := s.sendSignal(addTrackReq); err != nil {
-		return fmt.Errorf("AddTrack: %w", err)
-	}
-
-	// 8. Wait for TrackPublished confirmation from SFU
-	select {
-	case <-s.trackPublishedCh:
-		sfuLog.Info("✅ Track registered by SFU")
-	case <-time.After(10 * time.Second):
-		sfuLog.Warn("⚠️ TrackPublished timeout, publishing anyway")
+		}
+		if err := s.sendSignal(addTrackReq); err != nil {
+			return fmt.Errorf("AddTrack %d: %w", i+1, err)
+		}
 	}
 
-	// 9. Publish our video track — send offer to SFU
+	// 8. Wait for all TrackPublished confirmations from SFU
+	published := 0
+	deadline := time.After(10 * time.Second)
+	for published < len(s.tracks) {
+		select {
+		case <-s.trackPublishedCh:
+			published++
+			sfuLog.Info("✅ Track %d/%d registered by SFU", published, len(s.tracks))
+		case <-deadline:
+			sfuLog.Warn("⚠️ TrackPublished timeout (%d/%d), publishing anyway", published, len(s.tracks))
+			published = len(s.tracks) // break out of loop
+		}
+	}
+
+	// 9. Publish our audio tracks — send offer to SFU (includes all tracks)
 	if err := s.publishTrack(); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
 
 	// 10. Setup data transport — prefer RTP audio tunnel for DPI evasion
-	// Create rtpconn adapter: yamux data flows through Opus RTP packets
+	// Create rtpconn adapter with multi-track pool: data is striped round-robin
+	// across the Opus track pool for spatial multi-tracking camouflage.
 	s.mu.Lock()
-	s.rtpDataConn = rtpconn.New(s.track, s.obfuscator) // encrypt payloads before they enter the Opus track
+	s.rtpDataConn = rtpconn.NewMulti(s.tracks, s.obfuscator)
 	s.useRTP = true
 	s.connected = true
 	s.mu.Unlock()
@@ -248,16 +266,26 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 		return err
 	}
 
-	// Create Opus audio track — DPI sees a normal voice call
-	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		"vpn-audio", "vpn-stream",
-	)
-	if err != nil {
-		return err
+	// Create Opus audio tracks — DPI sees a normal voice call / group call
+	// with multiple active lines.  Data is striped round-robin across these
+	// tracks by rtpconn for spatial multi-tracking camouflage.
+	numTracks := s.numTracks
+	if numTracks < 1 {
+		numTracks = 1
 	}
-	if _, err := pc.AddTrack(track); err != nil {
-		return err
+	s.tracks = s.tracks[:0] // reset
+	for i := 0; i < numTracks; i++ {
+		track, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			fmt.Sprintf("vpn-audio-%d", i), "vpn-stream",
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := pc.AddTrack(track); err != nil {
+			return err
+		}
+		s.tracks = append(s.tracks, track)
 	}
 
 	// No DataChannel needed — all tunnel data flows through Opus RTP.
@@ -287,7 +315,6 @@ func (s *SFUTransport) createPublisher(iceServers []webrtc.ICEServer) error {
 	})
 
 	s.pubPC = pc
-	s.track = track
 	return nil
 }
 
